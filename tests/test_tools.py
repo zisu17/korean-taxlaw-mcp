@@ -131,9 +131,11 @@ async def test_lookup_returns_exact_match(upstream) -> None:
     assert doc["documentNumber"] == "서면-2026-법규재산-0119"
     assert doc["documentType"] == "질의회신"
     assert doc["authorityLevel"] == "nts_ruling"
-    assert doc["citation"]["sourceSystem"] == "국세법령정보시스템"
-    assert doc["citation"]["sourceUrl"].endswith("ntstDcmId=200000000000022584")
+    assert doc["sourceUrl"].endswith("ntstDcmId=200000000000022584")
     assert "조세특례제한법 제71조의2" in doc["relatedLaws"]
+    # 출처 중복 블록(citation)과 성공 시 진단 메타데이터는 싣지 않는다 (토큰 예산)
+    assert "citation" not in doc
+    assert "triedQueries" not in data and "inputInterpretation" not in data
 
 
 async def test_lookup_normalizes_all_input_variants(upstream) -> None:
@@ -182,8 +184,11 @@ async def test_search_interpretations_shape(upstream) -> None:
     assert label == "OK"
     assert data["domain"] == "interpretation"
     assert data["items"]
-    assert all(i["authorityLevel"] == "nts_ruling" for i in data["items"])
-    assert "AND" in data["searchSemantics"]
+    for item in data["items"]:
+        # 검색 결과는 후보 목록이다 — 본문·상수 boilerplate 를 싣지 않는다
+        for banned in ("fullText", "facts", "reasoning", "citation", "authorityLevel"):
+            assert banned not in item, f"검색 결과에 {banned} 가 실렸다"
+        assert item["ntstDcmId"] and item["sourceUrl"]
 
 
 async def test_search_sends_and_semantics_to_upstream(upstream) -> None:
@@ -334,8 +339,10 @@ async def test_basic_ruling_returns_body_and_authority_warning(upstream) -> None
     assert label == "OK"
     assert data["items"]
     assert any(i.get("text") for i in data["items"])
-    assert all(i["authorityLevel"] == "nts_guidance" for i in data["items"])
-    assert "법규가 아닙니다" in data["authorityWarning"]
+    # 권위 층위는 응답에 한 번만 싣는다 — 항목마다 반복하지 않는다
+    assert data["authorityLevel"] == "nts_guidance"
+    assert all("authorityLevel" not in i for i in data["items"])
+    assert "법규가 아닌" in data["authorityWarning"]
 
 
 async def test_execution_standard_declares_missing_body(upstream) -> None:
@@ -346,7 +353,9 @@ async def test_execution_standard_declares_missing_body(upstream) -> None:
     assert label == "OK"
     assert data["items"]
     assert all("text" not in i for i in data["items"])
-    assert all("PDF" in i["textUnavailableReason"] for i in data["items"])
+    # 본문 부재 사유는 항목마다 반복하지 않고 응답에 한 번만 싣는다
+    assert "PDF" in data["textUnavailableReason"]
+    assert all("textUnavailableReason" not in i for i in data["items"])
 
 
 async def test_notice_requires_all_subject_code(upstream) -> None:
@@ -369,8 +378,10 @@ async def test_forms_use_search_prefixed_param(upstream) -> None:
     assert label == "OK"
     _a, param = next(c for c in upstream.calls if c[0] == "ASIAFB001MR01")
     assert "searchNtstBscId" in param
-    assert data["items"][0]["authorityLevel"] == "enforcement_rule"
-    assert "POST" in data["items"][0]["downloadNote"]
+    # 공통값은 응답 최상위에 한 번만 — 항목마다 반복하지 않는다
+    assert data["authorityLevel"] == "enforcement_rule"
+    assert "POST" in data["downloadNote"]
+    assert all("downloadNote" not in i and "citation" not in i for i in data["items"])
 
 
 # ─── 통합 검색 ────────────────────────────────────────────────────────────────
@@ -380,8 +391,8 @@ async def test_search_taxlaw_strips_routing_words(upstream) -> None:
     label, data = await call("search_taxlaw", {"query": "국세청 예규 공동상속주택"})
     assert label == "OK"
     assert data["searchQuery"] == "공동상속주택"
-    assert data["taxTypeFilterApplied"] is None
-    assert "누락" in data["taxTypeNote"]
+    # 세목을 명시하지 않으면 필터를 걸지 않고, 그 사실을 필드 부재로 나타낸다
+    assert "taxTypeFilterApplied" not in data
 
 
 async def test_search_taxlaw_prefers_exact_document_number(upstream) -> None:
