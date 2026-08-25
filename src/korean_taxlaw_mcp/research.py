@@ -20,6 +20,7 @@ from .codes import TAX_TYPE, TAX_TYPE_ALIAS
 from .domains.documents import INTERPRETATION_CLASSES, search_documents
 from .domains.guidance import EXECUTION_STANDARD_BOOKS, list_basic_ruling_laws, search_guidance
 from .model import AuthorityLevel
+from .payload import drop_empty
 
 DISCLAIMER = (
     "원문 검색 결과 모음이며 법률적 판단이 아닙니다. 층별 authorityLevel(법규·행정해석·"
@@ -228,7 +229,10 @@ async def tax_research(
             _layer(
                 layer_name, level, provider="NTS",
                 status="found" if result["items"] else "empty",
-                query=base_query, total=result["total"], items=result["items"],
+                query=base_query, total=result["total"],
+                # 항목에는 URL 이 없으므로 층에 템플릿을 한 번 싣는다
+                sourceUrlTemplate=result.get("sourceUrlTemplate"),
+                items=result["items"],
             )
         )
 
@@ -246,7 +250,7 @@ async def tax_research(
 
     return {
         "question": question,
-        "extracted": {k: v for k, v in extracted.items() if v},
+        "extracted": drop_empty(extracted),
         "layers": layers,
         "disclaimer": DISCLAIMER,
     }

@@ -188,3 +188,15 @@ def truncate(text: str, limit: int | None = None) -> Truncated:
         "나머지는 sourceUrl 원문에서 확인하세요.]"
     )
     return Truncated(text[:cap] + note, True, original)
+
+
+def attach_full_text(out: dict[str, object], text: str, limit: int | None) -> None:
+    """``fullText``(+절단 표식)를 응답 dict 에 싣는 단일 규칙.
+
+    국세·지방세 상세가 같은 계약을 쓴다: 잘리지 않았으면 플래그를 싣지 않는다.
+    """
+    full = truncate(text, limit)
+    out["fullText"] = full.text
+    if full.truncated:
+        out["fullTextTruncated"] = True
+        out["fullTextOriginalLength"] = full.original_length

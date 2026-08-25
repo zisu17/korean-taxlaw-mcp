@@ -56,9 +56,9 @@ def test_search_rows_map_to_summary(fixture, name, doc_class, _l) -> None:
         assert item["ntstDcmId"].isdigit()
         assert item["documentNumber"]
         assert item["title"]
-        assert item["sourceUrl"].startswith("https://taxlaw.nts.go.kr/")
-        # 검색 요약에 본문·상수 boilerplate 가 실리면 안 된다 (토큰 예산)
-        for banned in ("fullText", "source", "domain", "citation"):
+        # 검색 요약에 본문·상수 boilerplate 가 실리면 안 된다 (토큰 예산).
+        # URL 은 응답 최상위 sourceUrlTemplate 로 한 번만 나간다.
+        for banned in ("fullText", "source", "domain", "citation", "sourceUrl"):
             assert banned not in item, f"검색 요약에 {banned} 가 실렸다"
         # 결정례는 불복 결정과 판례가 섞이므로 권위 층위를 남기고, 해석례는 생략한다
         if doc_class in DECISION_CLASSES:

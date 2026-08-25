@@ -24,8 +24,9 @@ from ..codes import (
 )
 from ..config import NTS_ORIGIN
 from ..errors import ErrorCode, NtsError, not_found
-from ..html_text import parse_body_html, strip_highlight, truncate
+from ..html_text import attach_full_text, parse_body_html, strip_highlight, truncate
 from ..model import AUTHORITY_LABEL, authority_for_doc_class
+from ..payload import drop_empty
 from ..query import SORT, build_vocab, format_date, to_site_date
 
 SEARCH_ACTION = "ASIPDI002PR01"
@@ -84,10 +85,11 @@ def _row_to_summary(dcm: dict[str, Any]) -> dict[str, Any]:
         "authorityLevel": str(authority_for_doc_class(doc_class))
         if doc_class in _DECISION_SET
         else None,
+        # sourceUrl 은 항목마다 싣지 않는다 — 검색 응답 최상위의 sourceUrlTemplate 에
+        # ntstDcmId 를 끼우면 같은 주소가 나온다 (항목당 ~70자 절감).
         "ntstDcmId": doc_id,
-        "sourceUrl": detail_url(doc_id, _kind_for(doc_class)),
     }
-    return {k: v for k, v in out.items() if v not in (None, "")}
+    return drop_empty(out)
 
 
 async def search_documents(
@@ -199,6 +201,8 @@ async def search_documents(
         "countsByDocClass": counts,
         "page": page,
         "limit": limit,
+        # 항목별 URL 대신 템플릿 1개 — 컬렉션이 단일 종류로 강제되므로 응답 내 동일하다
+        "sourceUrlTemplate": detail_url("{ntstDcmId}", _kind_for(classes[0])),
         "items": items,
     }
 
@@ -315,11 +319,7 @@ async def get_document(
     # 절이 하나라도 분해됐으면 fullText 를 싣지 않는다 — 절(+preamble)이 제목 줄을
     # 제외한 본문 전체를 담으므로, 전문을 함께 실으면 같은 본문이 두 번 전달된다.
     if parsed and include_full_text and not parsed.sections:
-        full = truncate(parsed.text, body_limit)
-        detail["fullText"] = full.text
-        if full.truncated:
-            detail["fullTextTruncated"] = True
-            detail["fullTextOriginalLength"] = full.original_length
+        attach_full_text(detail, parsed.text, body_limit)
 
     if not parsed:
         detail["bodyUnavailable"] = True
@@ -328,4 +328,4 @@ async def get_document(
             "메타데이터만 확인된 상태이며, 본문은 sourceUrl 원문에서 확인해야 합니다."
         )
 
-    return {k: v for k, v in detail.items() if v not in (None, "", [])}
+    return drop_empty(detail)

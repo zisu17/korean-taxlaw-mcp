@@ -24,7 +24,7 @@ import re
 from typing import Any
 
 from ..action_client import call_action
-from ..cache import TTL
+from ..cache import TTL, cache
 from ..config import NTS_ORIGIN
 from ..errors import ErrorCode, NtsError, not_found
 from ..html_text import html_to_text, truncate
@@ -124,6 +124,22 @@ def _years(rows: list[dict[str, Any]]) -> list[str]:
     return sorted((y for y in seen if y), key=lambda y: -int(y))
 
 
+def _parse_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """조항 행 → ``{title, itemId, text?}``. 캐시에 실리는 값이므로 호출자는
+    이 목록과 항목 dict 를 **변경하지 않고** 필터·슬라이스로만 써야 한다."""
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        title = re.sub(r"\s+", " ", str(r.get("ntstTextNm") or "")).strip()
+        text = html_to_text(str(r.get("ntstTextCntn") or ""))
+        entry: dict[str, Any] = {"title": title}
+        if r.get("ntstExrBaseSn"):
+            entry["itemId"] = str(r["ntstExrBaseSn"])
+        if text:
+            entry["text"] = truncate(text).text
+        items.append(entry)
+    return items
+
+
 async def get_basic_rulings(
     *, law_name: str, revision_year: str | None = None, query: str | None = None, limit: int = 40
 ) -> dict[str, Any]:
@@ -143,21 +159,18 @@ async def get_basic_rulings(
         )
     year = revision_year or available[0]
 
-    payload = await call_action(
-        "ASISTD001MR02", {"ntstBscId": law["ntstBscId"], "rgtYr": year}, ttl=TTL.GUIDANCE
-    )
-    rows = (payload or {}).get("bscExrDVOList") or []
+    # 조항 수백 건의 HTML→텍스트 변환은 싸지 않다. HTTP 응답은 call_action 이
+    # 캐시하지만 파싱은 호출마다 반복됐으므로, **파싱 결과**를 같은 TTL 로 캐시한다.
+    # get_tax_guidance 처럼 전체를 받아 1건만 고르는 호출이 반복돼도 재파싱하지 않는다.
+    async def produce() -> list[dict[str, Any]]:
+        payload = await call_action(
+            "ASISTD001MR02", {"ntstBscId": law["ntstBscId"], "rgtYr": year}, ttl=TTL.GUIDANCE
+        )
+        return _parse_items((payload or {}).get("bscExrDVOList") or [])
 
-    items: list[dict[str, Any]] = []
-    for r in rows:
-        title = re.sub(r"\s+", " ", str(r.get("ntstTextNm") or "")).strip()
-        text = html_to_text(str(r.get("ntstTextCntn") or ""))
-        entry: dict[str, Any] = {"title": title}
-        if r.get("ntstExrBaseSn"):
-            entry["itemId"] = str(r["ntstExrBaseSn"])
-        if text:
-            entry["text"] = truncate(text).text
-        items.append(entry)
+    items = await cache.wrap(
+        f"parsed:basic_ruling:{law['ntstBscId']}:{year}", TTL.GUIDANCE, produce
+    )
 
     if query:
         needle = query.strip()
@@ -195,21 +208,15 @@ async def get_execution_standards(
         )
     year = revision_year or available[0]
 
-    payload = await call_action(
-        "ASISTE001MR02", {"ntstBscId": book["ntstBscId"], "rgtYr": year}, ttl=TTL.GUIDANCE
-    )
-    rows = (payload or {}).get("exeBaseDVOList") or []
+    async def produce() -> list[dict[str, Any]]:
+        payload = await call_action(
+            "ASISTE001MR02", {"ntstBscId": book["ntstBscId"], "rgtYr": year}, ttl=TTL.GUIDANCE
+        )
+        return _parse_items((payload or {}).get("exeBaseDVOList") or [])
 
-    items: list[dict[str, Any]] = []
-    for r in rows:
-        title = re.sub(r"\s+", " ", str(r.get("ntstTextNm") or "")).strip()
-        text = html_to_text(str(r.get("ntstTextCntn") or ""))
-        entry: dict[str, Any] = {"title": title}
-        if r.get("ntstExrBaseSn"):
-            entry["itemId"] = str(r["ntstExrBaseSn"])
-        if text:
-            entry["text"] = truncate(text).text
-        items.append(entry)
+    items = await cache.wrap(
+        f"parsed:execution_standard:{book['ntstBscId']}:{year}", TTL.GUIDANCE, produce
+    )
 
     if query:
         needle = query.strip()
