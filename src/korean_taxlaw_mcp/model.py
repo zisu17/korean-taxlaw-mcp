@@ -7,9 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any
 
 
 class AuthorityLevel(StrEnum):
@@ -51,23 +49,6 @@ def authority_for_doc_class(doc_class: str) -> AuthorityLevel:
     return AuthorityLevel.NTS_RULING
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def make_citation(
-    *, source_id: str, document_number: str, source_url: str, source_agency: str | None = None
-) -> dict[str, Any]:
-    """모든 반환 문서가 갖는 출처 블록.
-
-    본문 일부만 실어도 원문을 되짚을 수 있어야 한다. 응답에 그대로 실리므로
-    키는 camelCase 로 둔다.
-    """
-    return {
-        "sourceAgency": source_agency or "국세청",
-        "sourceSystem": "국세법령정보시스템",
-        "sourceId": source_id,
-        "documentNumber": document_number,
-        "sourceUrl": source_url,
-        "retrievedAt": now_iso(),
-    }
+# citation 블록은 제거했다 — sourceAgency(=issuingAgency)·documentNumber·sourceUrl 이
+# 모두 문서 최상위 필드와 중복이라, 문서 하나마다 ~250자를 컨텍스트에 반복해 실었다.
+# 출처 표기는 documentNumber + registrationDate + sourceUrl 로 충분하다.

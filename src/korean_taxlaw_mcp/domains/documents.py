@@ -25,7 +25,7 @@ from ..codes import (
 from ..config import NTS_ORIGIN
 from ..errors import ErrorCode, NtsError, not_found
 from ..html_text import parse_body_html, strip_highlight, truncate
-from ..model import AUTHORITY_LABEL, authority_for_doc_class, make_citation
+from ..model import AUTHORITY_LABEL, authority_for_doc_class
 from ..query import SORT, build_vocab, format_date, to_site_date
 
 SEARCH_ACTION = "ASIPDI002PR01"
@@ -52,22 +52,21 @@ def _kind_for(doc_class: str) -> str:
 
 
 def _row_to_summary(dcm: dict[str, Any]) -> dict[str, Any]:
-    """검색 행(대문자 스네이크 필드) → 요약 문서."""
+    """검색 행(대문자 스네이크 필드) → 요약 문서.
+
+    검색 결과는 **후보 목록**이다 — 본문은 싣지 않고, 상수 boilerplate(source·domain)도
+    항목마다 반복하지 않는다. LLM 이 후보를 고르는 데 필요한 것:
+    문서번호·제목·세목·요지·날짜·상세조회 ID.
+    """
 
     def get(key: str) -> str:
         return strip_highlight(dcm.get(key, "")).strip()
 
     doc_class = get("NTST_DCM_CL_CD") or (get("MAIN_ID").split("_")[-1] if "_" in get("MAIN_ID") else "")
     doc_id = get("DOC_ID")
-    rank_raw = get("RANK")
-    try:
-        rank = float(rank_raw) if rank_raw else 0.0
-    except ValueError:
-        rank = 0.0
+    disclosure = get("STTT_INFR_CL_NM") or decode_or_none(DISCLOSURE, get("STTT_INFP_CL_CD"))
 
     out: dict[str, Any] = {
-        "source": "NTS",
-        "domain": _domain_for(doc_class),
         "documentType": get("LBL1_TTL") or DOC_CLASS.get(doc_class) or get("NTST_DCM_CL_NM"),
         "documentNumber": get("NTST_DCM_DSCM_CNTN"),
         "title": get("TTL"),
@@ -78,14 +77,17 @@ def _row_to_summary(dcm: dict[str, Any]) -> dict[str, Any]:
         "attributionYear": get("ATTR_YR") or None,
         "registrationDate": format_date(get("NTST_DCM_RGT_DT") or get("DCM_RGT_DTM_S")),
         "summary": get("GIST_CNTN") or None,
-        "disclosure": get("STTT_INFR_CL_NM") or decode_or_none(DISCLOSURE, get("STTT_INFP_CL_CD")),
-        "authorityLevel": str(authority_for_doc_class(doc_class)),
+        # '공개'가 기본이므로 비공개·부분공개일 때만 표시한다
+        "disclosure": disclosure if disclosure and disclosure != "공개" else None,
+        # 결정례 검색(05~10)은 불복 결정과 판례가 섞이므로 권위 층위를 항목에 남긴다.
+        # 해석례(01~04)는 전부 nts_ruling 이라 생략한다.
+        "authorityLevel": str(authority_for_doc_class(doc_class))
+        if doc_class in _DECISION_SET
+        else None,
         "ntstDcmId": doc_id,
         "sourceUrl": detail_url(doc_id, _kind_for(doc_class)),
     }
-    if rank > 0:
-        out["relevance"] = rank
-    return {k: v for k, v in out.items() if v is not None}
+    return {k: v for k, v in out.items() if v not in (None, "")}
 
 
 async def search_documents(
@@ -177,15 +179,17 @@ async def search_documents(
     wanted = set(_to_dcm_cl_cd_ctl(classes))
 
     counts: list[dict[str, Any]] = []
+    total = 0
     for entry in categories:
         name = entry.get("name", "")
         if name not in wanted:
             continue
         code = name.split("_")[-1]
-        counts.append(
-            {"code": code, "label": DOC_CLASS.get(code, code), "count": int(entry.get("count") or 0)}
-        )
-    total = sum(c["count"] for c in counts)
+        count = int(entry.get("count") or 0)
+        total += count
+        # 0건인 문서구분은 항목으로 반복하지 않는다 — total 로 충분하다
+        if count:
+            counts.append({"code": code, "label": DOC_CLASS.get(code, code), "count": count})
 
     body = (payload or {}).get("body") or []
     items = [_row_to_summary(row["dcm"]) for row in body if row.get("dcm")]
@@ -243,27 +247,13 @@ async def get_document(
     parsed = parse_body_html(raw_html) if isinstance(raw_html, str) and raw_html else None
     sections = parsed.sections if parsed else {}
 
-    attachments = [
-        {
-            "fileId": str(x["dcmFleId"]),
-            **({"fileSn": str(x["dcmFleSn"])} if x.get("dcmFleSn") else {}),
-            "fileType": str(x.get("dcmFleTy") or ""),
-        }
-        for x in hwp_list
-        if x.get("dcmFleId") and str(x.get("dcmFleTy", "")).lower() != "html"
-    ]
-
-    related_articles: list[dict[str, str]] = []
-    for r in (payload or {}).get("dcmRltnStttList") or []:
-        name = str(r.get("ntstTextNm") or "").strip()
-        if not name:
-            continue
-        entry: dict[str, str] = {"lawName": name}
-        if not is_blank_code(r.get("bsafRfkNo1")):
-            entry["lawId"] = str(r["bsafRfkNo1"])
-        if not is_blank_code(r.get("bsafRfkNo2")):
-            entry["articleId"] = str(r["bsafRfkNo2"])
-        related_articles.append(entry)
+    related_laws = list(
+        dict.fromkeys(
+            name
+            for r in (payload or {}).get("dcmRltnStttList") or []
+            if (name := str(r.get("ntstTextNm") or "").strip())
+        )
+    )
 
     related_documents = [
         strip_highlight(r.get("ntstDcmDscmCntn"))
@@ -289,7 +279,6 @@ async def get_document(
 
     level = authority_for_doc_class(doc_class)
     detail: dict[str, Any] = {
-        "source": "NTS",
         "domain": _domain_for(doc_class),
         "documentType": DOC_CLASS.get(doc_class) or str(dvo.get("ntstDcmClNm") or ""),
         "documentNumber": document_number,
@@ -306,40 +295,31 @@ async def get_document(
         else strip_highlight(dvo.get("ntstPrdgHpnnNoCntn")),
         "disclosure": decode_or_none(DISCLOSURE, dvo.get("stttInfpClCd")),
         "keywords": keywords,
-        "gist": gist_text,
         "summary": gist_text,
         "answer": answer_text,
-        "facts": cut(sections.get("facts")),
-        "question": cut(sections.get("question")),
-        "claimantView": cut(sections.get("claimantView")),
-        "agencyView": cut(sections.get("agencyView")),
-        "relatedLawsText": cut(sections.get("relatedLaws")),
-        "issue": cut(sections.get("issue")),
-        "reasoning": cut(sections.get("reasoning")),
-        "conclusion": cut(sections.get("conclusion")),
-        "relatedLaws": [r["lawName"] for r in related_articles],
-        "relatedArticles": related_articles,
+        "preamble": cut(parsed.preamble) if parsed else None,
+        "relatedLaws": related_laws,
         "relatedDocuments": related_documents,
-        "attachments": attachments,
         "authorityLevel": str(level),
         "authorityNote": AUTHORITY_LABEL[level],
         "ntstDcmId": doc_id,
         "sourceUrl": url,
-        "citation": make_citation(
-            source_id=doc_id,
-            document_number=document_number,
-            source_url=url,
-            source_agency=decode_or_none(ISSUING_AGENCY, dvo.get("ntstDcmSrcsOrgnClCd")) or "국세청",
-        ),
     }
 
-    if parsed and include_full_text:
+    # 파서가 인식한 절을 **전부** 응답에 싣는다. 절 이름을 여기서 다시 열거하면
+    # 파서 어휘(_SECTION_PATTERNS)에 절이 추가될 때 응답에서 조용히 빠진다.
+    for name, text in sections.items():
+        key = "relatedLawsText" if name == "relatedLaws" else name
+        detail[key] = cut(text)
+
+    # 절이 하나라도 분해됐으면 fullText 를 싣지 않는다 — 절(+preamble)이 제목 줄을
+    # 제외한 본문 전체를 담으므로, 전문을 함께 실으면 같은 본문이 두 번 전달된다.
+    if parsed and include_full_text and not parsed.sections:
         full = truncate(parsed.text, body_limit)
         detail["fullText"] = full.text
-        detail["fullTextTruncated"] = full.truncated
-        detail["fullTextOriginalLength"] = full.original_length
-    if parsed:
-        detail["sectionHeadings"] = parsed.headings
+        if full.truncated:
+            detail["fullTextTruncated"] = True
+            detail["fullTextOriginalLength"] = full.original_length
 
     if not parsed:
         detail["bodyUnavailable"] = True
@@ -348,4 +328,4 @@ async def get_document(
             "메타데이터만 확인된 상태이며, 본문은 sourceUrl 원문에서 확인해야 합니다."
         )
 
-    return {k: v for k, v in detail.items() if v is not None}
+    return {k: v for k, v in detail.items() if v not in (None, "", [])}

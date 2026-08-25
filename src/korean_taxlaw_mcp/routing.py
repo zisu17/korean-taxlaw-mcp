@@ -92,21 +92,6 @@ class RouteHint:
     #: 질의에서 추정한 세목. 필터로 강제하지 않는다.
     tax_type_codes: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> dict[str, object]:
-        out: dict[str, object] = {
-            "isNtsQuery": self.is_nts_query,
-            "domains": self.domains,
-            "contentQuery": self.content_query,
-            "reasons": self.reasons,
-        }
-        if self.doc_classes:
-            out["docClasses"] = self.doc_classes
-        if self.document_number:
-            out["documentNumber"] = self.document_number
-        if self.tax_type_codes:
-            out["taxTypeCodes"] = self.tax_type_codes
-        return out
-
 
 def route_query(query: str | None) -> RouteHint:
     q = str(query or "")

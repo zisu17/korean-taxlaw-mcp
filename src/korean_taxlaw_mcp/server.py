@@ -83,10 +83,19 @@ _DECISION_TYPE_CODE = {
     "constitutional": "10",  # 헌재
 }
 
-SEARCH_SEMANTICS = (
-    "공백으로 구분한 낱말은 AND, match='any' 는 OR(내부적으로 ASCII 파이프), "
-    "exclude 는 NOT 으로 사이트에 전달됩니다."
-)
+def _prune(value: Any) -> Any:
+    """null·빈 문자열·빈 컨테이너 필드를 재귀 제거한다.
+
+    각 도메인 계층도 자체적으로 걸러내지만, 여기서 한 번 더 거는 이유는 이것이
+    **모든 성공 응답에 대한 불변식**이기 때문이다 — 새 도구가 걸러내는 것을 잊어도
+    빈 필드가 LLM 컨텍스트로 새지 않는다. False·0 은 의미 있는 값이므로 남긴다.
+    """
+    if isinstance(value, dict):
+        pruned = {k: _prune(v) for k, v in value.items()}
+        return {k: v for k, v in pruned.items() if v is not None and v != "" and v != [] and v != {}}
+    if isinstance(value, list):
+        return [_prune(v) for v in value]
+    return value
 
 
 def _ok(payload: dict[str, Any]) -> str:
@@ -94,8 +103,11 @@ def _ok(payload: dict[str, Any]) -> str:
 
     첫 줄에 ``[OK]`` 같은 대괄호 라벨을 두는 것은 기계 독자를 향한 계약이다 —
     모델은 산문 속 완곡한 유보는 흘려보내지만 첫 토큰의 라벨은 놓치지 않는다.
+
+    JSON 은 들여쓰기 없이 직렬화한다 — 응답은 사람이 아니라 LLM 이 읽으며,
+    들여쓰기 공백도 전부 컨텍스트 토큰으로 계산된다.
     """
-    return "[OK]\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    return "[OK]\n" + json.dumps(_prune(payload), ensure_ascii=False, separators=(",", ":"))
 
 
 def _envelope_errors(fn):
@@ -115,7 +127,9 @@ def _envelope_errors(fn):
         try:
             return await fn(*args, **kwargs)
         except NtsError as exc:
-            return f"[{exc.code}]\n" + json.dumps(exc.envelope(), ensure_ascii=False, indent=2)
+            return f"[{exc.code}]\n" + json.dumps(
+                exc.envelope(), ensure_ascii=False, separators=(",", ":")
+            )
 
     return wrapper
 
@@ -168,28 +182,18 @@ def _merge_law(query: str | None, law: str | None, article: str | None) -> str |
 @mcp.tool(
     name="lookup_tax_document",
     description=(
-        "문서번호로 국세청 문서를 **정확히 일치하는 것만** 찾아 본문까지 반환한다. "
-        "세법해석례(사전답변·질의회신·과세기준자문·고시서면질의)와 판례·결정례"
-        "(과세적부·이의신청·심사청구·심판청구·판례·헌재)를 자동 판별한다. "
-        "'서면-2026-법규재산-0119', '서면 2026 법규재산 0119', '서면2026법규재산0119', "
-        "'질의회신 서면-2026-법규재산-0119' 처럼 표기가 달라도 같은 문서로 정규화한다. "
-        "정확히 일치하는 문서가 없으면 NOT_FOUND 를 반환하고, 번호가 일부 겹치는 문서는 "
-        "similarDocuments 로 분리해 준다(정답이 아님). 문서번호를 아는 경우 항상 이 도구를 먼저 쓸 것."
+        "문서번호로 국세청 문서(해석례·판례·결정례 자동 판별)를 **정확히 일치할 때만** "
+        "본문까지 반환한다. 표기 편차('서면 2026 법규재산 0119' 등)는 자동 정규화한다. "
+        "없으면 NOT_FOUND — similarDocuments 는 번호가 일부 겹치는 별개 문서이며 정답이 아니다. "
+        "문서번호를 아는 경우 검색 대신 항상 이 도구를 먼저 쓸 것."
     ),
 )
 @_envelope_errors
 async def lookup_tax_document(
     document_number: Annotated[
-        str,
-        Field(
-            min_length=2,
-            description=(
-                "문서번호. 표기 편차를 자동 정규화한다. 적부-국세청-2026-0119 처럼 "
-                "기관이 번호에 포함된 형식도 지원."
-            ),
-        ),
+        str, Field(min_length=2, description="문서번호. 표기 편차 자동 정규화.")
     ],
-    include_full_text: Annotated[bool, Field(description="본문 전문 포함 여부")] = True,
+    include_full_text: Annotated[bool, Field(description="본문 포함 여부")] = True,
     body_limit: Annotated[
         int | None, Field(ge=500, le=200_000, description="본문 최대 글자수(기본 30000)")
     ] = None,
@@ -198,7 +202,7 @@ async def lookup_tax_document(
         document_number, include_full_text=include_full_text, body_limit=body_limit
     )
     if outcome["found"]:
-        return _ok({"input": document_number, **outcome})
+        return _ok(outcome)
 
     raise NtsError(
         ErrorCode.NOT_FOUND,
@@ -232,31 +236,30 @@ async def lookup_tax_document(
 @mcp.tool(
     name="search_tax_interpretations",
     description=(
-        "국세청 세법해석례(예규)를 검색한다. 대상: 사전답변(01)·질의회신(02, 서면질의)·"
-        "과세기준자문(03)·고시서면질의(04). 키워드·세목·관련법령·조문·기간으로 좁힐 수 있다. "
-        "공백으로 구분한 낱말은 AND, match='any' 는 OR, exclude 는 NOT 이다. "
-        "문서번호를 알고 있으면 document_number 를 넘기면 exact lookup 으로 처리된다. "
-        "법제처 미러가 아니라 국세청 원본을 직접 조회하므로 최신 예규가 바로 잡힌다."
+        "국세청 세법해석례(예규: 사전답변·질의회신·과세기준자문·고시서면질의)를 검색한다. "
+        "결과는 요지까지만 담은 후보 목록이며 본문은 포함하지 않는다 — 필요한 문서만 "
+        "get_tax_document 로 상세 조회할 것. 공백 구분 낱말은 AND, match='any' 는 OR, "
+        "exclude 는 NOT. 문서번호를 알면 lookup_tax_document 를 쓸 것."
     ),
 )
 @_envelope_errors
 async def search_tax_interpretations(
-    query: Annotated[str | None, Field(description="검색 키워드. 공백 구분은 AND. 따옴표로 묶으면 한 구절.")] = None,
-    document_number: Annotated[str | None, Field(description="문서번호를 주면 exact lookup 을 수행한다.")] = None,
+    query: Annotated[str | None, Field(description="검색 키워드. 공백 구분은 AND.")] = None,
+    document_number: Annotated[str | None, Field(description="문서번호를 주면 exact lookup 수행.")] = None,
     type: Annotated[
         Literal["all", "advance", "written", "advisory", "notice_written"],
         Field(description="all(기본) | advance(사전답변) | written(질의회신) | advisory(과세기준자문) | notice_written(고시서면질의)"),
     ] = "all",
-    tax_type: Annotated[str | list[str] | None, Field(description="세목. 이름·별칭·코드(301~315) 허용.")] = None,
-    law: Annotated[str | None, Field(description="관련 법령명(예: '상속세 및 증여세법')")] = None,
+    tax_type: Annotated[str | list[str] | None, Field(description="세목. 이름·별칭·코드 허용.")] = None,
+    law: Annotated[str | None, Field(description="관련 법령명")] = None,
     article: Annotated[str | None, Field(description="관련 조문(예: '제35조')")] = None,
     match: Annotated[Literal["all", "any"], Field(description="all=AND(기본), any=OR")] = "all",
     exclude: Annotated[list[str] | None, Field(description="제외할 낱말(NOT)")] = None,
     date_from: Annotated[str | None, Field(description="등록일 시작 (YYYY-MM-DD)")] = None,
     date_to: Annotated[str | None, Field(description="등록일 종료 (YYYY-MM-DD)")] = None,
     sort: Annotated[Literal["latest", "oldest", "relevance"] | None, Field(description="정렬")] = None,
-    page: Annotated[int, Field(ge=1, description="페이지 번호(1부터). 오프셋이 아니다.")] = 1,
-    limit: Annotated[int, Field(ge=1, le=100, description="페이지 크기")] = 20,
+    page: Annotated[int, Field(ge=1, description="페이지 번호(1부터)")] = 1,
+    limit: Annotated[int, Field(ge=1, le=100, description="페이지 크기. 명시 요청 없이는 늘리지 말 것.")] = 10,
 ) -> str:
     # 문서번호가 주어지면 키워드 검색이 아니라 exact lookup 이 먼저다.
     if document_number and document_number.strip():
@@ -286,7 +289,7 @@ async def search_tax_interpretations(
                 *([f"인식하지 못한 세목: {', '.join(unresolved)}"] if unresolved else []),
             ],
         )
-    payload: dict[str, Any] = {"domain": "interpretation", **result, "searchSemantics": SEARCH_SEMANTICS}
+    payload: dict[str, Any] = {"domain": "interpretation", **result}
     if unresolved:
         payload["unresolvedTaxTypes"] = unresolved
     return _ok(payload)
@@ -299,10 +302,10 @@ async def search_tax_interpretations(
 @mcp.tool(
     name="search_tax_decisions",
     description=(
-        "국세청·조세심판원·법원의 판례·결정례를 검색한다. 대상: 과세적부(05)·이의신청(06)·"
-        "심사청구(07)·심판청구(08)·판례(09)·헌재(10). "
-        "결정결과(인용·기각·각하·경정·재조사·국승·국패 등)와 귀속연도로 필터할 수 있다. "
-        "사건번호를 알면 case_number 로 넘기면 exact lookup 이 수행된다."
+        "국세청·조세심판원·법원의 판례·결정례(과세적부·이의신청·심사청구·심판청구·판례·헌재)를 "
+        "검색한다. 결과는 본문 없는 후보 목록 — 필요한 문서만 get_tax_document 로 조회할 것. "
+        "결정결과(인용·기각·국승·국패 등)와 귀속연도 필터 지원. "
+        "사건번호를 알면 case_number 로 exact lookup 이 수행된다."
     ),
 )
 @_envelope_errors
@@ -324,7 +327,7 @@ async def search_tax_decisions(
     date_to: Annotated[str | None, Field(description="등록일 종료")] = None,
     sort: Annotated[Literal["latest", "oldest", "relevance"] | None, Field(description="정렬")] = None,
     page: Annotated[int, Field(ge=1)] = 1,
-    limit: Annotated[int, Field(ge=1, le=100)] = 20,
+    limit: Annotated[int, Field(ge=1, le=100, description="페이지 크기. 명시 요청 없이는 늘리지 말 것.")] = 10,
 ) -> str:
     if case_number and case_number.strip():
         return await lookup_tax_document(document_number=case_number)
@@ -359,7 +362,7 @@ async def search_tax_decisions(
                 *([f"인식하지 못한 세목: {', '.join(unresolved)}"] if unresolved else []),
             ],
         )
-    payload: dict[str, Any] = {"domain": "decision", **found, "searchSemantics": SEARCH_SEMANTICS}
+    payload: dict[str, Any] = {"domain": "decision", **found}
     if unresolved:
         payload["unresolvedTaxTypes"] = unresolved
     return _ok(payload)
@@ -372,10 +375,9 @@ async def search_tax_decisions(
 @mcp.tool(
     name="get_tax_document",
     description=(
-        "국세청 문서 1건의 본문·구조화 필드를 가져온다. ntst_dcm_id(검색 결과의 문서 ID) 또는 "
-        "document_number 로 지정한다. 해석례는 요지·질의내용·사실관계·회신·관련법령으로, "
-        "결정례는 처분개요·청구인주장·처분청의견·심리및판단·결론으로 분해해 반환한다. "
-        "문서 종류에 따라 존재하는 절이 다르므로 없는 절은 생략된다. "
+        "국세청 문서 1건의 본문을 가져온다. ntst_dcm_id(검색 결과의 ID) 또는 document_number 로 "
+        "지정한다. 본문은 절(사실관계·질의·회신·주장·판단·결론 등)로 분해되며, 절 분해가 "
+        "본문을 다 담지 못할 때만 fullText 가 추가된다. 없는 절은 생략된다. "
         "본문을 원본이 주지 않으면 DETAIL_NOT_AVAILABLE 로 알리고 본문을 생성하지 않는다."
     ),
 )
@@ -383,7 +385,7 @@ async def search_tax_decisions(
 async def get_tax_document(
     ntst_dcm_id: Annotated[str | None, Field(description="국세법령정보시스템 문서 ID(숫자 18자리)")] = None,
     document_number: Annotated[str | None, Field(description="문서번호. ID 를 모를 때 사용.")] = None,
-    include_full_text: Annotated[bool, Field(description="본문 전문 포함 여부")] = True,
+    include_full_text: Annotated[bool, Field(description="본문 포함 여부")] = True,
     body_limit: Annotated[int | None, Field(ge=500, le=200_000)] = None,
 ) -> str:
     if not (ntst_dcm_id or document_number):
@@ -414,20 +416,18 @@ async def get_tax_document(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _AUTHORITY_WARNING = (
-    "기본통칙·집행기준·고시·훈령은 국세청 내부 집행기준으로, 법률·시행령·시행규칙과 같은 "
-    "법규가 아닙니다. 법적 근거로 인용할 때는 반드시 근거 법조문을 함께 확인하세요."
+    "기본통칙·집행기준·고시·훈령은 법규가 아닌 국세청 내부 집행기준입니다. "
+    "인용 시 근거 법조문을 함께 확인하세요."
 )
 
 
 @mcp.tool(
     name="search_tax_guidance",
     description=(
-        "국세청 행정 해석기준을 검색한다. kind: basic_ruling(국세 기본통칙) | "
-        "execution_standard(세법집행기준) | notice(국세청 고시) | directive(국세청 훈령). "
-        "기본통칙은 조항 본문까지 제공되고, 집행기준은 조항명(목차)까지만 제공된다"
-        "(원본이 본문을 API 로 주지 않음). 기본통칙·집행기준은 law_name 이 필요하다"
-        "(예: '상속세 및 증여세법', '상속증여세 집행기준'). "
-        "이 자료는 법규가 아닌 국세청 내부 집행기준임을 결과에 함께 표기한다."
+        "국세청 행정 해석기준을 검색한다. kind: basic_ruling(기본통칙, 조항 본문 포함) | "
+        "execution_standard(집행기준, 조항명 목차만 — 원본이 본문 미제공) | notice(고시) | "
+        "directive(훈령). 기본통칙·집행기준은 law_name 필수(예: '상속세 및 증여세법'). "
+        "법규가 아닌 내부 집행기준이다."
     ),
 )
 @_envelope_errors
@@ -440,7 +440,7 @@ async def search_tax_guidance(
     revision_year: Annotated[str | None, Field(pattern=r"^\d{4}$", description="개정연도. 생략하면 최신본")] = None,
     query: Annotated[str | None, Field(description="조항명·본문 키워드")] = None,
     page: Annotated[int, Field(ge=1)] = 1,
-    limit: Annotated[int, Field(ge=1, le=300)] = 40,
+    limit: Annotated[int, Field(ge=1, le=300, description="반환 조항 수")] = 20,
 ) -> str:
     result = await search_guidance(
         kind=kind, law_name=law_name, revision_year=revision_year,
@@ -493,7 +493,19 @@ async def get_tax_guidance(
             f"{law_name} {result['revisionYear']}년 {label} 에서 {target} 을 찾지 못했습니다.",
             [f"해당 연도 조항 수: {len(items)}. search_tax_guidance 로 조항명을 먼저 확인하세요."],
         )
-    return _ok({"lawName": result["lawName"], "revisionYear": result["revisionYear"], "item": hit})
+    # 출처·권위 표기는 조항 1건 응답에도 유지한다 — 인용 근거가 없는 법문은 쓸 수 없다.
+    payload: dict[str, Any] = {
+        "kind": result.get("kind"),
+        "authorityLevel": result.get("authorityLevel"),
+        "authorityNote": result.get("authorityNote"),
+        "sourceUrl": result.get("sourceUrl"),
+        "lawName": result["lawName"],
+        "revisionYear": result["revisionYear"],
+        "item": hit,
+    }
+    if "text" not in hit and result.get("textUnavailableReason"):
+        payload["textUnavailableReason"] = result["textUnavailableReason"]
+    return _ok(payload)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -503,9 +515,8 @@ async def get_tax_guidance(
 @mcp.tool(
     name="search_tax_forms",
     description=(
-        "국세 법령서식·별표를 검색한다. 서식명·관련법령·개정일·서식 파일 식별자를 반환한다. "
-        "파일 실물은 국세법령정보시스템이 POST 폼으로만 내려주므로 이 서버는 바이너리를 "
-        "제공하지 않고 조회 화면 URL 을 준다."
+        "국세 법령서식·별표를 검색한다. 서식명·관련법령·개정일을 반환한다. "
+        "파일 실물은 제공하지 않고 조회 화면 URL 을 준다."
     ),
 )
 @_envelope_errors
@@ -513,7 +524,7 @@ async def search_tax_forms(
     query: Annotated[str | None, Field(description="서식명 키워드")] = None,
     law_name: Annotated[str | None, Field(description="관련 법령명으로 한정")] = None,
     page: Annotated[int, Field(ge=1)] = 1,
-    limit: Annotated[int, Field(ge=1, le=100)] = 20,
+    limit: Annotated[int, Field(ge=1, le=100)] = 10,
 ) -> str:
     result = await search_forms(query=query, law_name=law_name, page=page, limit=limit)
     if not result["items"]:
@@ -551,17 +562,18 @@ async def search_taxlaw(
     # 난다 — '상속 공동상속주택' 은 308 로 추정되지만 정작 맞는 예규는 307 로 분류돼 있다.
     search_query = hint.content_query or query
 
-    # 문서번호가 섞여 있으면 exact lookup 이 최우선이다.
+    # 문서번호가 섞여 있으면 exact lookup 이 최우선이다. 여기서는 존재 확인과 요약이
+    # 목적이므로 본문 상세 조회는 생략한다(필요하면 get_tax_document 로 이어서 조회).
     if hint.document_number or looks_like_document_number(query):
         outcome = await lookup_by_document_number(
-            hint.document_number or query.strip(), include_full_text=False
+            hint.document_number or query.strip(), metadata_only=True
         )
         if outcome["found"]:
             return _ok({
                 "resolvedBy": "documentNumber",
-                "routing": hint.to_dict(),
                 "exactMatch": True,
                 "document": outcome["document"],
+                "note": "본문은 get_tax_document(ntst_dcm_id)로 조회하세요.",
             })
 
     results: dict[str, Any] = {}
@@ -618,20 +630,16 @@ async def search_taxlaw(
             ],
         )
 
+    # routing 근거·긴 안내문은 payload 에 싣지 않는다 — 검색어 변환 결과(searchQuery)와
+    # 조회 영역만 있으면 모델이 다음 행동을 정할 수 있다.
     payload: dict[str, Any] = {
         "query": query,
         "searchQuery": search_query,
-        "routing": hint.to_dict(),
         "domainsSearched": targets,
-        "taxTypeFilterApplied": codes or None,
-        "taxTypeNote": (
-            "사용자가 지정한 세목으로 필터링했습니다."
-            if codes
-            else "세목 필터를 적용하지 않았습니다(추정 세목을 강제하면 분류가 다른 관련 문서가 "
-                 "누락될 수 있음). routing.taxTypeCodes 는 참고용 추정치입니다."
-        ),
         "results": results,
     }
+    if codes:
+        payload["taxTypeFilterApplied"] = codes
     if errors:
         payload["partialErrors"] = errors
     return _ok(payload)
@@ -644,11 +652,9 @@ async def search_taxlaw(
 @mcp.tool(
     name="tax_research",
     description=(
-        "세무 쟁점 하나를 층별 근거로 모아 온다: 법률→시행령→시행규칙(범위 밖, 확인 경로 안내)"
-        "→기본통칙→세법집행기준→국세청 해석례→불복 결정례→판례·헌재. "
-        "각 층에 authorityLevel 을 붙여 법규와 행정해석과 개별 결정의 효력 차이를 구분한다. "
-        "**법률적 판단이나 결론을 만들지 않는다** — 원문 근거 수집과 출처 제시만 한다. "
-        "법령 본문이 필요하면 korean-law-mcp 를 함께 쓸 것."
+        "세무 쟁점 하나의 근거를 층별로 모은다: 기본통칙→집행기준→해석례→불복 결정례→판례·헌재. "
+        "각 층에 authorityLevel 을 붙인다. 법률적 판단은 하지 않으며 근거 수집만 한다. "
+        "법령 본문은 korean-law-mcp 를 쓸 것."
     ),
 )
 @_envelope_errors
@@ -671,20 +677,13 @@ async def tax_research(
 # 지방세 (한국지방세연구원 지방세 법령정보시스템)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_LOCAL_NOTE = (
-    "지방세 자료는 한국지방세연구원(KILF) 지방세 법령정보시스템이 출처입니다. "
-    "국세청 자료가 아니며, 취득세·재산세·자동차세·지방소득세 등 지방세만 담습니다."
-)
-
-
 @mcp.tool(
     name="search_local_tax_interpretations",
     description=(
-        "지방세 유권해석을 검색한다. 취득세·등록면허세·재산세·자동차세·주민세·지방소득세·"
-        "지역자원시설세·지방교육세·담배소비세 등 **지방세** 사안이 대상이다. "
-        "행정안전부 유권해석(지방세 예규)과 법제처 유권해석을 조회한다 — 국세청 예규의 "
-        "지방세 대응물이다. 문서번호(예: '부동산세제과-1794')를 주면 exact lookup 으로 처리된다. "
-        "국세(양도소득세·법인세·부가가치세 등)는 search_tax_interpretations 를 쓸 것."
+        "지방세(취득세·재산세·자동차세·주민세·지방소득세·등록면허세 등) 유권해석을 검색한다 — "
+        "행정안전부·법제처 해석. 결과는 본문 없는 후보 목록이며, 본문은 "
+        "lookup_local_tax_document 로 조회할 것. 문서번호를 알면 document_number 로 exact lookup. "
+        "국세는 search_tax_interpretations 를 쓸 것."
     ),
 )
 @_envelope_errors
@@ -730,7 +729,7 @@ async def search_local_tax_interpretations(
                 *([f"인식하지 못한 세목: {', '.join(unresolved)}"] if unresolved else []),
             ],
         )
-    payload: dict[str, Any] = {"taxLevel": "local", "domain": "interpretation", **result, "note": _LOCAL_NOTE}
+    payload: dict[str, Any] = {"taxLevel": "local", "domain": "interpretation", **result}
     if unresolved:
         payload["unresolvedTaxTypes"] = unresolved
     return _ok(payload)
@@ -739,9 +738,8 @@ async def search_local_tax_interpretations(
 @mcp.tool(
     name="search_local_tax_decisions",
     description=(
-        "지방세 불복 결정례·판례를 검색한다. 조세심판원 심판결정례, 감사원 심사결정례, "
-        "법원 판례, 헌법재판소 결정례 중 **지방세** 사안이 대상이다. "
-        "취득세·재산세 등 지방세 쟁점의 심판례·판례를 찾을 때 쓴다. "
+        "지방세 사안의 불복 결정례·판례(조세심판원·감사원·법원·헌재)를 검색한다. "
+        "결과는 본문 없는 후보 목록 — 본문은 lookup_local_tax_document 로 조회할 것. "
         "국세 사안은 search_tax_decisions 를 쓸 것."
     ),
 )
@@ -781,7 +779,7 @@ async def search_local_tax_decisions(
                 *([f"인식하지 못한 세목: {', '.join(unresolved)}"] if unresolved else []),
             ],
         )
-    payload: dict[str, Any] = {"taxLevel": "local", "domain": "decision", **result, "note": _LOCAL_NOTE}
+    payload: dict[str, Any] = {"taxLevel": "local", "domain": "decision", **result}
     if unresolved:
         payload["unresolvedTaxTypes"] = unresolved
     return _ok(payload)
@@ -790,25 +788,22 @@ async def search_local_tax_decisions(
 @mcp.tool(
     name="lookup_local_tax_document",
     description=(
-        "지방세 문서를 문서번호 또는 문서 ID 로 조회해 본문까지 반환한다. "
-        "문서번호는 '부동산세제과-1794(2026.6.9.)호', '부동산세제과-1794', '부동산세제과 1794' 처럼 "
-        "표기가 달라도 같은 문서로 정규화한다. "
-        "**정확히 일치하는 문서만** 반환하며, 없으면 NOT_FOUND 와 함께 일련번호가 겹치는 문서를 "
-        "similarDocuments 로 분리해 준다(정답 아님). "
-        "사이트의 문서번호 검색은 일련번호 부분일치라서 '924' 는 '지방세정팀-2924' 도 함께 잡는다 — "
-        "그래서 부서명까지 일치해야 exact 로 인정한다."
+        "지방세 문서를 문서번호 또는 문서 ID(+kind)로 조회해 본문까지 반환한다. "
+        "문서번호 표기 편차('부동산세제과-1794(2026.6.9.)호' 등)는 자동 정규화하며, "
+        "**정확히 일치할 때만** 반환한다(부서명+일련번호 모두 일치). "
+        "없으면 NOT_FOUND — similarDocuments 는 일련번호가 겹치는 별개 문서이며 정답이 아니다."
     ),
 )
 @_envelope_errors
 async def lookup_local_tax_document(
     document_number: Annotated[str | None, Field(description="지방세 문서번호(예: 부동산세제과-1794)")] = None,
-    document_id: Annotated[str | None, Field(description="사이트 내부 문서 ID(검색 결과의 documentId)")] = None,
+    document_id: Annotated[str | None, Field(description="검색 결과의 documentId")] = None,
     relationship_num: Annotated[str | None, Field(description="법원 판례 전용 보조 ID(검색 결과의 relationshipNum)")] = None,
     kind: Annotated[
         Literal["interpretation", "moleg", "tribunal", "audit", "court", "constitutional"] | None,
-        Field(description="자료 종류. document_id 를 줄 때는 필수. 생략하면 전 종류를 순차 조회."),
+        Field(description="자료 종류. document_id 를 줄 때는 필수."),
     ] = None,
-    include_full_text: Annotated[bool, Field(description="본문 전문 포함 여부")] = True,
+    include_full_text: Annotated[bool, Field(description="본문 포함 여부")] = True,
     body_limit: Annotated[int | None, Field(ge=500, le=200_000)] = None,
 ) -> str:
     if document_id and document_id.strip():
@@ -822,7 +817,7 @@ async def lookup_local_tax_document(
             kind, document_id.strip(), relationship_num=relationship_num,
             include_full_text=include_full_text, body_limit=body_limit,
         )
-        return _ok({"document": document, "note": _LOCAL_NOTE})
+        return _ok({"document": document})
 
     if not (document_number and document_number.strip()):
         raise NtsError(ErrorCode.INVALID_INPUT, "document_number 또는 document_id 중 하나는 필요합니다.")
@@ -834,7 +829,7 @@ async def lookup_local_tax_document(
         body_limit=body_limit,
     )
     if outcome["found"]:
-        return _ok({"input": document_number, "note": _LOCAL_NOTE, **outcome})
+        return _ok(outcome)
 
     raise NtsError(
         ErrorCode.NOT_FOUND,
