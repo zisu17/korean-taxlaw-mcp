@@ -1,6 +1,6 @@
 [project]
 name = "korean-taxlaw-mcp"
-version = "1.0.0"
+version = "2.0.0"
 description = "한국 세법 자료 통합 조회 MCP 서버 — 현재 국세청 국세법령정보시스템 원본 조회 지원"
 readme = "README.md"
 requires-python = ">=3.11"
