@@ -53,6 +53,13 @@ class Upstream:
             if name is None:
                 return httpx.Response(200, json=_envelope(action_id, {"dcmDVO": None}))
             return httpx.Response(200, json=_envelope(action_id, load(name)))
+        for aid, name in (
+            ("ASISTD001MR01", "guidance_basic_ruling_laws"),
+            ("ASISTD001MR03", "guidance_basic_ruling_years"),
+            ("ASISTD001MR02", "guidance_basic_ruling_items"),
+        ):
+            if action_id == aid:
+                return httpx.Response(200, json=_envelope(action_id, load(name)))
         return httpx.Response(200, json=_envelope(action_id, {}))
 
 
@@ -123,17 +130,21 @@ async def test_search_results_carry_no_body(upstream) -> None:
 
 # ─── 2. 기본 limit ───────────────────────────────────────────────────────────
 
-async def test_search_default_limit_is_10(upstream) -> None:
+async def test_search_default_limit_matches_config(upstream) -> None:
+    from korean_taxlaw_mcp.config import DEFAULT_SEARCH_LIMIT
+
+    assert DEFAULT_SEARCH_LIMIT == 10  # 명시 요청 없이 20건씩 반환하지 않는다
+
     upstream.default_search = "search_written"
     await call("search_tax_interpretations", {"query": "상속"})
     _a, param = next(c for c in upstream.calls if c[0] == "ASIPDI002PR01")
-    assert param["viewCount"] == 10
+    assert param["viewCount"] == DEFAULT_SEARCH_LIMIT
 
     upstream.calls.clear()
     upstream.default_search = "search_tribunal"
     await call("search_tax_decisions", {"query": "상속"})
     _a, param = next(c for c in upstream.calls if c[0] == "ASIPDI002PR01")
-    assert param["viewCount"] == 10
+    assert param["viewCount"] == DEFAULT_SEARCH_LIMIT
 
 
 # ─── 3. 상세 조회: 절 분해 + fullText 비중복 + 내용 무손실 ────────────────────
@@ -232,3 +243,60 @@ async def test_json_is_compact(upstream) -> None:
     text = result.content[0].text
     body = text[text.index("\n") + 1 :]
     assert "\n  " not in body, "응답 JSON 에 들여쓰기가 있다 — 토큰 낭비"
+
+
+# ─── 7. detail="compact" 모드 ────────────────────────────────────────────────
+
+async def test_compact_detail_keeps_conclusion_drops_body_sections(upstream) -> None:
+    """compact 는 요지·회신·결론만 남긴다 — 사실관계·주장·이유 절은 생략."""
+    upstream.detail_by_id["200000000000022584"] = "detail_written"
+    label, data = await call(
+        "get_tax_document", {"ntst_dcm_id": "200000000000022584", "detail": "compact"}
+    )
+    assert label == "OK"
+    doc = data["document"]
+    assert doc["summary"] and doc["answer"]
+    assert doc["documentNumber"] and doc["sourceUrl"]
+    for banned in ("facts", "question", "relatedLawsText", "reasoning", "fullText", "preamble"):
+        assert banned not in doc, f"compact 응답에 {banned}"
+
+    # 기본값(full)은 절 전체를 반환해야 한다
+    label, data = await call("get_tax_document", {"ntst_dcm_id": "200000000000022584"})
+    assert data["document"]["facts"]
+
+
+async def test_compact_lookup_passthrough(upstream) -> None:
+    upstream.default_search = "search_docnumber_exact"
+    upstream.detail_by_id["200000000000022584"] = "detail_written"
+    label, data = await call(
+        "lookup_tax_document",
+        {"document_number": "서면-2026-법규재산-0119", "detail": "compact"},
+    )
+    assert label == "OK"
+    assert data["document"]["summary"]
+    assert "facts" not in data["document"]
+
+
+# ─── 8. sourceUrl 템플릿 ─────────────────────────────────────────────────────
+
+async def test_search_items_use_url_template(upstream) -> None:
+    upstream.default_search = "search_written"
+    _label, data = await call("search_tax_interpretations", {"query": "분양권"})
+    template = data["sourceUrlTemplate"]
+    assert "{ntstDcmId}" in template
+    for item in data["items"]:
+        assert "sourceUrl" not in item
+        # 템플릿에 ID 를 끼우면 유효한 상세 URL 이 된다
+        assert template.replace("{ntstDcmId}", item["ntstDcmId"]).startswith(
+            "https://taxlaw.nts.go.kr/"
+        )
+
+
+# ─── 9. guidance 파싱 캐시가 결과를 오염시키지 않는지 ────────────────────────
+
+async def test_guidance_parse_cache_is_not_mutated_by_filters(upstream) -> None:
+    """query 필터가 캐시된 전체 목록을 줄여 놓으면 다음 호출이 오염된다."""
+    args = {"kind": "basic_ruling", "law_name": "상속세 및 증여세법"}
+    _l, filtered = await call("search_tax_guidance", {**args, "query": "상속재산", "limit": 300})
+    _l, full = await call("search_tax_guidance", {**args, "limit": 300})
+    assert filtered["total"] < full["total"], "필터가 캐시 원본을 줄여 놓았다"

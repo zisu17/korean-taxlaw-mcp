@@ -13,7 +13,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..action_client import detail_url
 from ..codes import collection_for
+from ..config import DEFAULT_SIMILAR_LIMIT
+from ..payload import slim
 from ..doc_number import is_same_doc_number, lookup_candidates, parse_doc_number
 from .documents import DECISION_CLASSES, INTERPRETATION_CLASSES, get_document, search_documents
 
@@ -33,11 +36,8 @@ def _domain_order(raw: str) -> list[str]:
     return ["interpretation", "decision"]
 
 
-def _slim_similar(item: dict[str, Any]) -> dict[str, Any]:
-    """유사문서는 '이런 별개 문서가 있다'는 신호만 주면 된다 — 요지·URL 까지 실어
-    NOT_FOUND 응답을 불리지 않는다."""
-    keep = ("documentType", "documentNumber", "title", "registrationDate", "ntstDcmId")
-    return {k: item[k] for k in keep if item.get(k)}
+#: 유사문서는 '이런 별개 문서가 있다'는 신호만 주면 된다 — 식별 필드만 남긴다.
+_SIMILAR_KEYS = ("documentType", "documentNumber", "title", "registrationDate", "ntstDcmId")
 
 
 async def lookup_by_document_number(
@@ -45,7 +45,7 @@ async def lookup_by_document_number(
     *,
     include_full_text: bool = True,
     body_limit: int | None = None,
-    similar_limit: int = 5,
+    similar_limit: int = DEFAULT_SIMILAR_LIMIT,
     metadata_only: bool = False,
 ) -> dict[str, Any]:
     """문서번호로 문서를 찾는다.
@@ -84,15 +84,17 @@ async def lookup_by_document_number(
                 if not item.get("ntstDcmId"):
                     continue
                 if is_same_doc_number(number, parsed.canonical) or is_same_doc_number(number, raw):
-                    document = (
-                        item
-                        if metadata_only
-                        else await get_document(
+                    if metadata_only:
+                        # 검색 요약에는 URL 이 없으므로(응답 최상위 템플릿으로 대체됨)
+                        # 단건 반환에는 sourceUrl 을 붙여 준다.
+                        kind = "question" if domain == "interpretation" else "precedent"
+                        document = {**item, "sourceUrl": detail_url(item["ntstDcmId"], kind)}
+                    else:
+                        document = await get_document(
                             item["ntstDcmId"],
                             include_full_text=include_full_text,
                             body_limit=body_limit,
                         )
-                    )
                     # 성공 응답에는 진단 메타데이터(triedQueries 등)를 싣지 않는다 —
                     # 그것들은 '왜 못 찾았는가'를 설명하는 값이라 NOT_FOUND 전용이다.
                     return {
@@ -104,7 +106,7 @@ async def lookup_by_document_number(
                 if number:
                     similar.setdefault(item["ntstDcmId"], item)
 
-    similar_documents = [_slim_similar(s) for s in list(similar.values())[:similar_limit]]
+    similar_documents = [slim(s, _SIMILAR_KEYS) for s in list(similar.values())[:similar_limit]]
     note = (
         "입력한 문서번호와 정확히 일치하는 문서가 없습니다. similarDocuments 는 문서번호 "
         "일부가 겹치는 별개의 문서이며, 요청한 문서가 아닙니다. 이 중 하나를 정답으로 "

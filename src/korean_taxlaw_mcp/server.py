@@ -19,6 +19,8 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from . import SERVER_NAME, __version__
+from .config import DEFAULT_GUIDANCE_LIMIT, DEFAULT_SEARCH_LIMIT
+from .payload import prune
 from .codes import DECISION_RESULT, TAX_TYPE, TAX_TYPE_ALIAS
 from .doc_number import looks_like_document_number
 from .domains.documents import (
@@ -83,19 +85,18 @@ _DECISION_TYPE_CODE = {
     "constitutional": "10",  # 헌재
 }
 
-def _prune(value: Any) -> Any:
-    """null·빈 문자열·빈 컨테이너 필드를 재귀 제거한다.
+#: detail="compact" 에서 걷어내는 본문 절 필드. 요지(summary)·회신(answer)·
+#: 결론(conclusion)·관련법령 이름·메타데이터·출처는 남긴다 — "무엇을 어떻게 판단했나"의
+#: 결론부만 필요할 때 사실관계·주장·이유 절의 토큰을 아낀다.
+_COMPACT_DROP = frozenset({
+    "facts", "question", "claimantView", "agencyView", "relatedLawsText", "issue",
+    "reasoning", "preamble", "body", "keywords", "relatedDocuments",
+    "fullText", "fullTextTruncated", "fullTextOriginalLength",
+})
 
-    각 도메인 계층도 자체적으로 걸러내지만, 여기서 한 번 더 거는 이유는 이것이
-    **모든 성공 응답에 대한 불변식**이기 때문이다 — 새 도구가 걸러내는 것을 잊어도
-    빈 필드가 LLM 컨텍스트로 새지 않는다. False·0 은 의미 있는 값이므로 남긴다.
-    """
-    if isinstance(value, dict):
-        pruned = {k: _prune(v) for k, v in value.items()}
-        return {k: v for k, v in pruned.items() if v is not None and v != "" and v != [] and v != {}}
-    if isinstance(value, list):
-        return [_prune(v) for v in value]
-    return value
+
+def _compact_document(doc: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in doc.items() if k not in _COMPACT_DROP}
 
 
 def _ok(payload: dict[str, Any]) -> str:
@@ -107,7 +108,7 @@ def _ok(payload: dict[str, Any]) -> str:
     JSON 은 들여쓰기 없이 직렬화한다 — 응답은 사람이 아니라 LLM 이 읽으며,
     들여쓰기 공백도 전부 컨텍스트 토큰으로 계산된다.
     """
-    return "[OK]\n" + json.dumps(_prune(payload), ensure_ascii=False, separators=(",", ":"))
+    return "[OK]\n" + json.dumps(prune(payload), ensure_ascii=False, separators=(",", ":"))
 
 
 def _envelope_errors(fn):
@@ -197,11 +198,17 @@ async def lookup_tax_document(
     body_limit: Annotated[
         int | None, Field(ge=500, le=200_000, description="본문 최대 글자수(기본 30000)")
     ] = None,
+    detail: Annotated[
+        Literal["full", "compact"],
+        Field(description="full(기본)=절 전체 | compact=요지·회신·결론만(사실관계·주장·이유 절 생략)"),
+    ] = "full",
 ) -> str:
     outcome = await lookup_by_document_number(
         document_number, include_full_text=include_full_text, body_limit=body_limit
     )
     if outcome["found"]:
+        if detail == "compact":
+            outcome = {**outcome, "document": _compact_document(outcome["document"])}
         return _ok(outcome)
 
     raise NtsError(
@@ -259,7 +266,7 @@ async def search_tax_interpretations(
     date_to: Annotated[str | None, Field(description="등록일 종료 (YYYY-MM-DD)")] = None,
     sort: Annotated[Literal["latest", "oldest", "relevance"] | None, Field(description="정렬")] = None,
     page: Annotated[int, Field(ge=1, description="페이지 번호(1부터)")] = 1,
-    limit: Annotated[int, Field(ge=1, le=100, description="페이지 크기. 명시 요청 없이는 늘리지 말 것.")] = 10,
+    limit: Annotated[int, Field(ge=1, le=100, description="페이지 크기. 명시 요청 없이는 늘리지 말 것.")] = DEFAULT_SEARCH_LIMIT,
 ) -> str:
     # 문서번호가 주어지면 키워드 검색이 아니라 exact lookup 이 먼저다.
     if document_number and document_number.strip():
@@ -327,7 +334,7 @@ async def search_tax_decisions(
     date_to: Annotated[str | None, Field(description="등록일 종료")] = None,
     sort: Annotated[Literal["latest", "oldest", "relevance"] | None, Field(description="정렬")] = None,
     page: Annotated[int, Field(ge=1)] = 1,
-    limit: Annotated[int, Field(ge=1, le=100, description="페이지 크기. 명시 요청 없이는 늘리지 말 것.")] = 10,
+    limit: Annotated[int, Field(ge=1, le=100, description="페이지 크기. 명시 요청 없이는 늘리지 말 것.")] = DEFAULT_SEARCH_LIMIT,
 ) -> str:
     if case_number and case_number.strip():
         return await lookup_tax_document(document_number=case_number)
@@ -387,6 +394,10 @@ async def get_tax_document(
     document_number: Annotated[str | None, Field(description="문서번호. ID 를 모를 때 사용.")] = None,
     include_full_text: Annotated[bool, Field(description="본문 포함 여부")] = True,
     body_limit: Annotated[int | None, Field(ge=500, le=200_000)] = None,
+    detail: Annotated[
+        Literal["full", "compact"],
+        Field(description="full(기본)=절 전체 | compact=요지·회신·결론만(사실관계·주장·이유 절 생략)"),
+    ] = "full",
 ) -> str:
     if not (ntst_dcm_id or document_number):
         raise NtsError(
@@ -403,11 +414,14 @@ async def get_tax_document(
                 "본문을 제공받지 못했습니다.",
                 detail={"document": document},
             )
+        if detail == "compact":
+            document = _compact_document(document)
         return _ok({"document": document})
     return await lookup_tax_document(
         document_number=document_number or "",
         include_full_text=include_full_text,
         body_limit=body_limit,
+        detail=detail,
     )
 
 
@@ -440,7 +454,7 @@ async def search_tax_guidance(
     revision_year: Annotated[str | None, Field(pattern=r"^\d{4}$", description="개정연도. 생략하면 최신본")] = None,
     query: Annotated[str | None, Field(description="조항명·본문 키워드")] = None,
     page: Annotated[int, Field(ge=1)] = 1,
-    limit: Annotated[int, Field(ge=1, le=300, description="반환 조항 수")] = 20,
+    limit: Annotated[int, Field(ge=1, le=300, description="반환 조항 수")] = DEFAULT_GUIDANCE_LIMIT,
 ) -> str:
     result = await search_guidance(
         kind=kind, law_name=law_name, revision_year=revision_year,
@@ -524,7 +538,7 @@ async def search_tax_forms(
     query: Annotated[str | None, Field(description="서식명 키워드")] = None,
     law_name: Annotated[str | None, Field(description="관련 법령명으로 한정")] = None,
     page: Annotated[int, Field(ge=1)] = 1,
-    limit: Annotated[int, Field(ge=1, le=100)] = 10,
+    limit: Annotated[int, Field(ge=1, le=100)] = DEFAULT_SEARCH_LIMIT,
 ) -> str:
     result = await search_forms(query=query, law_name=law_name, page=page, limit=limit)
     if not result["items"]:
@@ -698,7 +712,7 @@ async def search_local_tax_interpretations(
     date_from: Annotated[str | None, Field(description="등록일 시작 (YYYY-MM-DD)")] = None,
     date_to: Annotated[str | None, Field(description="등록일 종료 (YYYY-MM-DD)")] = None,
     page: Annotated[int, Field(ge=1, description="페이지 번호(1부터). 한 페이지 10건.")] = 1,
-    limit: Annotated[int, Field(ge=1, le=50, description="반환 개수")] = 10,
+    limit: Annotated[int, Field(ge=1, le=50, description="반환 개수")] = DEFAULT_SEARCH_LIMIT,
 ) -> str:
     if document_number and document_number.strip():
         return await lookup_local_tax_document(document_number=document_number)
@@ -755,7 +769,7 @@ async def search_local_tax_decisions(
     date_from: Annotated[str | None, Field(description="등록일 시작")] = None,
     date_to: Annotated[str | None, Field(description="등록일 종료")] = None,
     page: Annotated[int, Field(ge=1)] = 1,
-    limit: Annotated[int, Field(ge=1, le=50)] = 10,
+    limit: Annotated[int, Field(ge=1, le=50)] = DEFAULT_SEARCH_LIMIT,
 ) -> str:
     if case_number and case_number.strip():
         return await lookup_local_tax_document(document_number=case_number)
@@ -805,6 +819,10 @@ async def lookup_local_tax_document(
     ] = None,
     include_full_text: Annotated[bool, Field(description="본문 포함 여부")] = True,
     body_limit: Annotated[int | None, Field(ge=500, le=200_000)] = None,
+    detail: Annotated[
+        Literal["full", "compact"],
+        Field(description="full(기본)=절 전체 | compact=요지·회신만(질의·이유·본문 절 생략)"),
+    ] = "full",
 ) -> str:
     if document_id and document_id.strip():
         if not kind:
@@ -817,6 +835,8 @@ async def lookup_local_tax_document(
             kind, document_id.strip(), relationship_num=relationship_num,
             include_full_text=include_full_text, body_limit=body_limit,
         )
+        if detail == "compact":
+            document = _compact_document(document)
         return _ok({"document": document})
 
     if not (document_number and document_number.strip()):
@@ -829,6 +849,8 @@ async def lookup_local_tax_document(
         body_limit=body_limit,
     )
     if outcome["found"]:
+        if detail == "compact":
+            outcome = {**outcome, "document": _compact_document(outcome["document"])}
         return _ok(outcome)
 
     raise NtsError(
