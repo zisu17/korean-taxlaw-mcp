@@ -18,7 +18,8 @@ from typing import Any
 from ..action_client import call_action
 from ..cache import TTL
 from ..config import NTS_ORIGIN
-from ..model import AUTHORITY_LABEL, AuthorityLevel, make_citation
+from ..model import AuthorityLevel
+from ..payload import drop_empty
 from ..query import format_date
 
 FORMS_URL = f"{NTS_ORIGIN}/af/USEAFB001M.do"
@@ -84,28 +85,20 @@ async def search_forms(
     items: list[dict[str, Any]] = []
     for r in rows:
         name = re.sub(r"\s+", " ", str(r.get("ntstAtFrmlNm") or "")).strip()
+        # 항목에는 서식을 특정하는 값만 싣는다. authorityLevel·sourceUrl·downloadNote
+        # 처럼 모든 서식에 동일한 값은 응답 최상위에 한 번만 둔다.
         entry: dict[str, Any] = {
-            "source": "NTS",
-            "domain": "form",
             "formName": name,
             "formSerial": str(r["ntstAtFrmlSn"]) if r.get("ntstAtFrmlSn") else None,
             "lawName": (str(r["ntstNm"]).strip() if r.get("ntstNm") else matched_law),
-            "lawTier": str(r["ntstSysClCd"]).strip() if r.get("ntstSysClCd") else None,
             "revisionDate": format_date(r.get("ntstPmgDt")),
-            "fileId": str(r["fleId"]) if r.get("fleId") else None,
-            "authorityLevel": str(AuthorityLevel.ENFORCEMENT_RULE),
-            "authorityNote": AUTHORITY_LABEL[AuthorityLevel.ENFORCEMENT_RULE],
-            "sourceUrl": FORMS_URL,
-            "citation": make_citation(
-                source_id=f"{r.get('ntstBscId') or ''}:{r.get('ntstAtFrmlSn') or ''}",
-                document_number=name,
-                source_url=FORMS_URL,
-            ),
-            "downloadNote": DOWNLOAD_NOTE,
         }
-        items.append({k: v for k, v in entry.items() if v is not None})
+        items.append(drop_empty(entry))
 
     out: dict[str, Any] = {
+        "authorityLevel": str(AuthorityLevel.ENFORCEMENT_RULE),
+        "sourceUrl": FORMS_URL,
+        "downloadNote": DOWNLOAD_NOTE,
         "total": int((payload or {}).get("recordCount") or 0),
         "page": page,
         "limit": limit,

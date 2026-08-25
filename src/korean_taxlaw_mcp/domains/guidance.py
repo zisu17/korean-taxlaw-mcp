@@ -24,11 +24,11 @@ import re
 from typing import Any
 
 from ..action_client import call_action
-from ..cache import TTL
+from ..cache import TTL, cache
 from ..config import NTS_ORIGIN
 from ..errors import ErrorCode, NtsError, not_found
 from ..html_text import html_to_text, truncate
-from ..model import AUTHORITY_LABEL, AuthorityLevel, make_citation
+from ..model import AUTHORITY_LABEL, AuthorityLevel
 from ..query import format_date
 
 GUIDANCE_LABEL: dict[str, str] = {
@@ -78,18 +78,18 @@ def _norm(s: str) -> str:
     return re.sub(r"[\s「」]|및|의", "", s)
 
 
-def _base_item(kind: str, title: str, source_id: str) -> dict[str, Any]:
-    url = _URL[kind]
+def _header(kind: str) -> dict[str, Any]:
+    """모든 항목에 공통인 값은 응답 최상위에 **한 번만** 싣는다.
+
+    이전에는 kind·authorityLevel·sourceUrl·citation 을 항목마다 반복해서
+    40건 조회면 같은 문장이 40번 컨텍스트에 실렸다.
+    """
     return {
-        "source": "NTS",
-        "domain": "guidance",
         "kind": kind,
         "kindLabel": GUIDANCE_LABEL[kind],
-        "title": title,
         "authorityLevel": str(AuthorityLevel.NTS_GUIDANCE),
         "authorityNote": AUTHORITY_LABEL[AuthorityLevel.NTS_GUIDANCE],
-        "sourceUrl": url,
-        "citation": make_citation(source_id=source_id, document_number=title, source_url=url),
+        "sourceUrl": _URL[kind],
     }
 
 
@@ -124,6 +124,22 @@ def _years(rows: list[dict[str, Any]]) -> list[str]:
     return sorted((y for y in seen if y), key=lambda y: -int(y))
 
 
+def _parse_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """조항 행 → ``{title, itemId, text?}``. 캐시에 실리는 값이므로 호출자는
+    이 목록과 항목 dict 를 **변경하지 않고** 필터·슬라이스로만 써야 한다."""
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        title = re.sub(r"\s+", " ", str(r.get("ntstTextNm") or "")).strip()
+        text = html_to_text(str(r.get("ntstTextCntn") or ""))
+        entry: dict[str, Any] = {"title": title}
+        if r.get("ntstExrBaseSn"):
+            entry["itemId"] = str(r["ntstExrBaseSn"])
+        if text:
+            entry["text"] = truncate(text).text
+        items.append(entry)
+    return items
+
+
 async def get_basic_rulings(
     *, law_name: str, revision_year: str | None = None, query: str | None = None, limit: int = 40
 ) -> dict[str, Any]:
@@ -143,36 +159,30 @@ async def get_basic_rulings(
         )
     year = revision_year or available[0]
 
-    payload = await call_action(
-        "ASISTD001MR02", {"ntstBscId": law["ntstBscId"], "rgtYr": year}, ttl=TTL.GUIDANCE
-    )
-    rows = (payload or {}).get("bscExrDVOList") or []
-
-    items: list[dict[str, Any]] = []
-    for r in rows:
-        title = re.sub(r"\s+", " ", str(r.get("ntstTextNm") or "")).strip()
-        text = html_to_text(str(r.get("ntstTextCntn") or ""))
-        entry = _base_item(
-            "basic_ruling", title, f"{law['ntstBscId']}:{year}:{r.get('ntstExrBaseSn') or ''}"
+    # 조항 수백 건의 HTML→텍스트 변환은 싸지 않다. HTTP 응답은 call_action 이
+    # 캐시하지만 파싱은 호출마다 반복됐으므로, **파싱 결과**를 같은 TTL 로 캐시한다.
+    # get_tax_guidance 처럼 전체를 받아 1건만 고르는 호출이 반복돼도 재파싱하지 않는다.
+    async def produce() -> list[dict[str, Any]]:
+        payload = await call_action(
+            "ASISTD001MR02", {"ntstBscId": law["ntstBscId"], "rgtYr": year}, ttl=TTL.GUIDANCE
         )
-        entry["lawName"] = law["ntstNm"]
-        entry["revisionYear"] = year
-        if r.get("ntstExrBaseSn"):
-            entry["itemId"] = str(r["ntstExrBaseSn"])
-        if text:
-            entry["text"] = truncate(text).text
-        items.append(entry)
+        return _parse_items((payload or {}).get("bscExrDVOList") or [])
+
+    items = await cache.wrap(
+        f"parsed:basic_ruling:{law['ntstBscId']}:{year}", TTL.GUIDANCE, produce
+    )
 
     if query:
         needle = query.strip()
         items = [i for i in items if needle in i["title"] or needle in i.get("text", "")]
 
     return {
+        **_header("basic_ruling"),
         "lawName": law["ntstNm"],
         "revisionYear": year,
         "availableYears": available,
         "total": len(items),
-        "items": items[: max(1, min(200, limit))],
+        "items": items[: max(1, min(300, limit))],
     }
 
 
@@ -197,49 +207,35 @@ async def get_execution_standards(
             [f"가능한 연도: {', '.join(available)}"],
         )
     year = revision_year or available[0]
-    file_row = next((r for r in year_rows if str(r.get("rgtYr")) == year), None)
 
-    payload = await call_action(
-        "ASISTE001MR02", {"ntstBscId": book["ntstBscId"], "rgtYr": year}, ttl=TTL.GUIDANCE
-    )
-    rows = (payload or {}).get("exeBaseDVOList") or []
-
-    items: list[dict[str, Any]] = []
-    for r in rows:
-        title = re.sub(r"\s+", " ", str(r.get("ntstTextNm") or "")).strip()
-        text = html_to_text(str(r.get("ntstTextCntn") or ""))
-        entry = _base_item(
-            "execution_standard", title, f"{book['ntstBscId']}:{year}:{r.get('ntstExrBaseSn') or ''}"
+    async def produce() -> list[dict[str, Any]]:
+        payload = await call_action(
+            "ASISTE001MR02", {"ntstBscId": book["ntstBscId"], "rgtYr": year}, ttl=TTL.GUIDANCE
         )
-        entry["lawName"] = book["ntstNm"]
-        entry["revisionYear"] = year
-        if r.get("ntstExrBaseSn"):
-            entry["itemId"] = str(r["ntstExrBaseSn"])
-        if text:
-            entry["text"] = truncate(text).text
-        else:
-            entry["textUnavailableReason"] = EXECUTION_STANDARD_UNAVAILABLE
-        if file_row and file_row.get("fleId"):
-            entry["file"] = {"fileId": str(file_row["fleId"])}
-            if file_row.get("fleSn"):
-                entry["file"]["fileSn"] = str(file_row["fleSn"])
-        items.append(entry)
+        return _parse_items((payload or {}).get("exeBaseDVOList") or [])
+
+    items = await cache.wrap(
+        f"parsed:execution_standard:{book['ntstBscId']}:{year}", TTL.GUIDANCE, produce
+    )
 
     if query:
         needle = query.strip()
         items = [i for i in items if needle in i["title"]]
+    items = items[: max(1, min(300, limit))]
 
-    return {
+    out: dict[str, Any] = {
+        **_header("execution_standard"),
         "lawName": book["ntstNm"],
         "revisionYear": year,
         "availableYears": available,
         "total": len(items),
-        "items": items[: max(1, min(300, limit))],
-        "note": (
-            "세법집행기준은 조항명(목차)까지만 조회됩니다. 조항 본문은 원본이 API 로 "
-            "제공하지 않으므로 sourceUrl 에서 확인해야 합니다."
-        ),
+        "items": items,
     }
+    # 본문 부재 사유는 항목마다 반복하지 않고 응답에 한 번만 싣는다.
+    # 최종 반환 items 기준으로 판단해야 '필터 결과가 전부 본문 없음' 인 경우를 놓치지 않는다.
+    if any("text" not in i for i in items):
+        out["textUnavailableReason"] = EXECUTION_STANDARD_UNAVAILABLE
+    return out
 
 
 async def get_notices_or_directives(
@@ -265,7 +261,7 @@ async def get_notices_or_directives(
 
     items: list[dict[str, Any]] = []
     for r in (payload or {}).get("notcFeldDVOList") or []:
-        entry = _base_item(kind, str(r.get("ntarNm") or "").strip(), str(r.get("ntarBscId") or ""))
+        entry: dict[str, Any] = {"title": str(r.get("ntarNm") or "").strip()}
         if r.get("ntarBscId"):
             entry["noticeId"] = str(r["ntarBscId"])
         promulgated = format_date(r.get("ntarPmgDt"))
@@ -278,6 +274,7 @@ async def get_notices_or_directives(
         items.append(entry)
 
     return {
+        **_header(kind),
         "total": int((payload or {}).get("recordCount") or 0),
         "page": page,
         "limit": limit,

@@ -47,17 +47,24 @@ def test_search_envelope_shape(fixture, name, doc_class, label) -> None:
     assert DOC_CLASS[doc_class] == label
 
 
-@pytest.mark.parametrize("name,_c,_l", SEARCH_FIXTURES)
-def test_search_rows_map_to_summary(fixture, name, _c, _l) -> None:
-    from korean_taxlaw_mcp.domains.documents import _row_to_summary
+@pytest.mark.parametrize("name,doc_class,_l", SEARCH_FIXTURES)
+def test_search_rows_map_to_summary(fixture, name, doc_class, _l) -> None:
+    from korean_taxlaw_mcp.domains.documents import DECISION_CLASSES, _row_to_summary
 
     for row in fixture(name)["body"]:
         item = _row_to_summary(row["dcm"])
         assert item["ntstDcmId"].isdigit()
         assert item["documentNumber"]
         assert item["title"]
-        assert item["authorityLevel"] in {"nts_ruling", "adjudication", "court_case"}
-        assert item["sourceUrl"].startswith("https://taxlaw.nts.go.kr/")
+        # 검색 요약에 본문·상수 boilerplate 가 실리면 안 된다 (토큰 예산).
+        # URL 은 응답 최상위 sourceUrlTemplate 로 한 번만 나간다.
+        for banned in ("fullText", "source", "domain", "citation", "sourceUrl"):
+            assert banned not in item, f"검색 요약에 {banned} 가 실렸다"
+        # 결정례는 불복 결정과 판례가 섞이므로 권위 층위를 남기고, 해석례는 생략한다
+        if doc_class in DECISION_CLASSES:
+            assert item["authorityLevel"] in {"adjudication", "court_case"}
+        else:
+            assert "authorityLevel" not in item
         # 하이라이트 마커가 새어 나가면 문서번호 비교가 깨진다
         assert "<!HS>" not in item["documentNumber"]
         assert "<!HE>" not in item["title"]

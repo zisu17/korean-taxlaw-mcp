@@ -122,6 +122,10 @@ _DETAIL_SECTIONS: list[tuple[str, re.Pattern[str]]] = [
     ("reasoning", re.compile(r"^<?\s*(이유|판단|심리\s*및\s*판단)\s*>?$")),
 ]
 
+#: 절 이름 목록. fullText 생략 판단(get_local_document)이 이 어휘와 어긋나면
+#: 본문이 이중 전송되거나 유실되므로, 이름을 여기서만 관리한다.
+DETAIL_SECTION_NAMES: tuple[str, ...] = tuple(name for name, _ in _DETAIL_SECTIONS)
+
 #: 상세 화면 머리글: "부동산세제과-1794(2026.6.9.)호(20260609) 재산세"
 _HEAD = re.compile(r"^(.*?)\((\d{8})\)\s*(\S*)\s*$")
 
@@ -179,6 +183,14 @@ def parse_detail(html: str) -> dict[str, object]:
             continue
         body = _tighten_articles(body)
         out[name] = f"{out[name]}\n\n{body}" if name in out else body
+
+    # 절 구간은 첫 절 제목부터 끝까지 연속이므로, 절에 속하지 않은 줄은 첫 절 제목
+    # 앞부분뿐이다. 절과 합치면 본문 전체가 복원되므로, 호출자는 fullText 를
+    # 중복으로 싣지 않아도 내용을 잃지 않는다.
+    if marks:
+        unsectioned = "\n".join(lines[: marks[0][0]]).strip()
+        if unsectioned:
+            out["unsectioned"] = _tighten_articles(unsectioned)
 
     full = _tighten_articles("\n".join(lines).strip())
     if full:

@@ -26,13 +26,14 @@ from datetime import date
 from typing import Any
 
 from ..codes import LOCAL_TAX_TYPE
-from ..config import OLTA
+from ..config import DEFAULT_SIMILAR_LIMIT, OLTA
 from ..errors import ErrorCode, NtsError, not_found
-from ..html_text import truncate
+from ..html_text import attach_full_text, truncate
 from ..local_doc_number import is_same_local_doc_number, parse_local_doc_number
-from ..model import AUTHORITY_LABEL, AuthorityLevel, make_citation
-from ..olta_client import SOURCES, detail_html, detail_url, list_url, search_html
-from ..olta_parse import parse_detail, parse_rows, parse_total
+from ..model import AUTHORITY_LABEL, AuthorityLevel
+from ..payload import drop_empty, slim
+from ..olta_client import SOURCES, detail_html, detail_url, search_html
+from ..olta_parse import DETAIL_SECTION_NAMES, parse_detail, parse_rows, parse_total
 from ..cache import TTL
 
 #: kind → 권위 층위. 유권해석은 국세청 예규와 같은 성격이므로 별도 층으로 둔다.
@@ -101,12 +102,9 @@ def resolve_tax_codes(value: str | list[str] | None) -> tuple[list[str], list[st
 
 
 def _summary(kind: str, row: dict[str, str]) -> dict[str, Any]:
-    level = _AUTHORITY[kind]
+    """목록 행 → 요약. 응답 최상위와 겹치는 상수 필드(source·taxLevel 등)는
+    항목마다 반복하지 않는다. kind 는 상세 조회 입력이므로 남긴다."""
     out: dict[str, Any] = {
-        "source": "KILF",
-        "sourceSystem": "지방세 법령정보시스템",
-        "taxLevel": "local",
-        "domain": "interpretation" if kind in INTERPRETATION_KINDS else "decision",
         "kind": kind,
         "documentType": SOURCES[kind].label,
         "documentNumber": row.get("documentNumber", ""),
@@ -114,14 +112,13 @@ def _summary(kind: str, row: dict[str, str]) -> dict[str, Any]:
         "taxType": row.get("taxType"),
         "registrationDate": row.get("registrationDate"),
         "summary": row.get("gist"),
-        "authorityLevel": str(level),
         "documentId": row["num"],
         # 법원 판례는 상세 조회에 둘째 인수가 필요하다.
         "relationshipNum": row.get("relationshipNum"),
         "decisionResult": row.get("decisionResult"),
         "sourceUrl": detail_url(kind, row["num"], row.get("relationshipNum")),
     }
-    return {k: v for k, v in out.items() if v is not None}
+    return drop_empty(out)
 
 
 async def search_local_documents(
@@ -232,7 +229,7 @@ async def get_local_document(
     level = _AUTHORITY[kind]
     url = detail_url(kind, doc_id, relationship_num)
     # 법원 판례 상세 화면은 머리글에 문서번호를 싣지 않는다. 목록에서 읽은 값으로
-    # 보완해야 인용(citation)이 비지 않는다.
+    # 보완해야 출처 표기가 비지 않는다.
     document_number = str(parsed.get("documentNumber") or fallback_document_number or "")
 
     def cut(value: object) -> str | None:
@@ -243,8 +240,6 @@ async def get_local_document(
     related_list = [x.strip() for x in re.split(r"[,;\n]", related) if x.strip()] if related else []
 
     out: dict[str, Any] = {
-        "source": "KILF",
-        "sourceSystem": "지방세 법령정보시스템",
         "taxLevel": "local",
         "domain": "interpretation" if kind in INTERPRETATION_KINDS else "decision",
         "kind": kind,
@@ -253,33 +248,27 @@ async def get_local_document(
         "title": str(parsed.get("title") or ""),
         "taxType": parsed.get("taxType"),
         "registrationDate": parsed.get("registrationDate"),
-        "gist": cut(parsed.get("gist")),
         "summary": cut(parsed.get("gist")),
         "question": cut(parsed.get("question")),
         "answer": cut(parsed.get("answer")),
         "reasoning": cut(parsed.get("reasoning")),
         "body": cut(parsed.get("body")),
+        "preamble": cut(parsed.get("unsectioned")),
         "relatedLaws": related_list,
         "authorityLevel": str(level),
         "authorityNote": AUTHORITY_LABEL[level],
         "documentId": doc_id,
         "sourceUrl": url,
-        "citation": make_citation(
-            source_id=doc_id,
-            document_number=document_number,
-            source_url=url,
-            source_agency="행정안전부" if kind == "interpretation" else SOURCES[kind].label,
-        ),
     }
-    if include_full_text and parsed.get("fullText"):
-        full = truncate(str(parsed["fullText"]), limit)
-        out["fullText"] = full.text
-        out["fullTextTruncated"] = full.truncated
-        out["fullTextOriginalLength"] = full.original_length
 
-    # 출처 시스템은 국세청이 아니므로 citation 의 sourceSystem 을 바로잡는다
-    out["citation"]["sourceSystem"] = "지방세 법령정보시스템"
-    return {k: v for k, v in out.items() if v is not None}
+    # 절 분해가 됐으면 fullText 를 싣지 않는다 — 절(+preamble)이 본문 전체를 담고
+    # 있어서, 전문을 함께 실으면 같은 본문이 두 번 전달된다.
+    full_text = str(parsed.get("fullText") or "")
+    has_sections = any(parsed.get(name) for name in DETAIL_SECTION_NAMES)
+    if include_full_text and full_text and not has_sections:
+        attach_full_text(out, full_text, limit)
+
+    return drop_empty(out)
 
 
 async def lookup_local_by_document_number(
@@ -288,7 +277,7 @@ async def lookup_local_by_document_number(
     kinds: list[str] | None = None,
     include_full_text: bool = True,
     body_limit: int | None = None,
-    similar_limit: int = 10,
+    similar_limit: int = DEFAULT_SIMILAR_LIMIT,
 ) -> dict[str, Any]:
     """문서번호로 지방세 문서를 찾는다. **정확히 일치할 때만** found.
 
@@ -309,8 +298,10 @@ async def lookup_local_by_document_number(
     for kind in targets:
         for candidate, doc_mode in candidates:
             tried.append(f"{kind}:{candidate}{'(문서번호)' if doc_mode else ''}")
+            # 사이트는 10건/페이지 — 30을 요청하면 순차 3회 왕복이 된다.
+            # exact 일치는 문서번호 검색 모드의 첫 페이지에 올라온다.
             result = await search_local_documents(
-                kinds=[kind], query=candidate, limit=30, doc_number_mode=doc_mode
+                kinds=[kind], query=candidate, limit=10, doc_number_mode=doc_mode
             )
             for item in result["items"]:
                 if is_same_local_doc_number(item.get("documentNumber", ""), raw):
@@ -320,20 +311,22 @@ async def lookup_local_by_document_number(
                         fallback_document_number=item.get("documentNumber"),
                         include_full_text=include_full_text, body_limit=body_limit,
                     )
+                    # 진단 메타데이터(triedQueries 등)는 NOT_FOUND 전용 — 성공에는 싣지 않는다.
                     return {
                         "found": True,
                         "exactMatch": True,
-                        "normalizedDocumentNumber": parsed.canonical,
-                        "inputInterpretation": parsed.interpretation(),
                         "kind": kind,
                         "document": document,
-                        "sourceUrl": document["sourceUrl"],
-                        "triedQueries": tried,
                     }
                 if item.get("documentNumber"):
                     similar.setdefault(item["documentId"], item)
 
-    similar_documents = list(similar.values())[:similar_limit]
+    # relationshipNum 은 법원 판례 상세 조회의 필수 둘째 인수라 빼면 후속 조회가 막힌다.
+    keep = (
+        "kind", "documentType", "documentNumber", "title",
+        "registrationDate", "documentId", "relationshipNum",
+    )
+    similar_documents = [slim(s, keep) for s in list(similar.values())[:similar_limit]]
     out: dict[str, Any] = {
         "found": False,
         "exactMatch": False,

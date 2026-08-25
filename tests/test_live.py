@@ -67,9 +67,12 @@ async def test_required_exact_lookups(document_number, expected_type, expected_d
     assert doc["documentNumber"] == document_number
     assert doc["documentType"] == expected_type
     assert doc["title"]
-    assert doc["citation"]["sourceUrl"].startswith("https://taxlaw.nts.go.kr/")
-    # 본문이 실제로 붙어 있어야 한다 — 이게 korean-law-mcp 로 안 되는 부분이다
-    assert doc.get("fullText"), "본문이 비었다"
+    assert doc["sourceUrl"].startswith("https://taxlaw.nts.go.kr/")
+    # 본문이 실제로 붙어 있어야 한다 — 이게 korean-law-mcp 로 안 되는 부분이다.
+    # 절 분해가 되면 본문은 절 필드로, 안 되면 fullText 로 온다(중복 전송 없음).
+    body_fields = ("fullText", "facts", "question", "reasoning", "conclusion",
+                   "claimantView", "agencyView", "relatedLawsText", "answer", "preamble")
+    assert any(doc.get(f) for f in body_fields), "본문이 비었다"
 
 
 async def test_required_variants_resolve_to_same_document() -> None:
@@ -260,9 +263,10 @@ async def test_tax_research_live() -> None:
     )
     assert label == "OK", data
     layers = {L["layer"]: L for L in data["layers"]}
-    # 법령 층은 범위 밖임을 명시해야 한다
-    assert layers["법률"]["status"] == "not_covered"
-    assert "korean-law-mcp" in layers["법률"]["message"]
+    # 법령 층(법률·시행령·시행규칙은 한 층으로 병합)은 범위 밖임을 명시해야 한다
+    statute = layers["법률·시행령·시행규칙"]
+    assert statute["status"] == "not_covered"
+    assert "korean-law-mcp" in statute["message"]
     # 국세청 자료 층은 실제로 결과가 있어야 한다
     assert layers["국세청 해석례"]["status"] == "found"
     assert layers["국세청 해석례"]["total"] > 0
@@ -351,7 +355,7 @@ async def test_local_exact_document_number_lookup() -> None:
         document = outcome["document"]
         assert document["documentNumber"].startswith("부동산세제과-1794")
         assert document["authorityLevel"] == "local_ruling"
-        assert document["citation"]["sourceSystem"] == "지방세 법령정보시스템"
+        assert document["sourceUrl"].startswith("https://www.olta.re.kr/")
 
 
 async def test_local_partial_serial_is_never_answered_as_exact() -> None:
@@ -386,7 +390,9 @@ async def test_local_list_to_detail_round_trip(kind: str) -> None:
         body_limit=2000,
     )
     assert document["documentNumber"], kind
-    assert document.get("fullText"), f"{kind}: 본문 없음"
+    # 절 분해가 되면 본문은 절 필드로, 안 되면 fullText 로 온다(중복 전송 없음).
+    body_fields = ("fullText", "summary", "question", "answer", "reasoning", "body", "preamble")
+    assert any(document.get(f) for f in body_fields), f"{kind}: 본문 없음"
     assert document["sourceUrl"].startswith("https://www.olta.re.kr/")
 
 
@@ -398,7 +404,8 @@ async def test_local_tools_via_mcp_client() -> None:
     assert label == "OK", data
     assert data["taxLevel"] == "local"
     assert data["items"]
-    assert all(item["authorityLevel"] == "local_ruling" for item in data["items"])
+    # 검색 요약은 후보 목록 — 본문·상수 boilerplate 를 싣지 않는다
+    assert all("fullText" not in item and item.get("kind") for item in data["items"])
 
     label, data = await call("lookup_local_tax_document", {"document_number": "924"})
     assert label == "NOT_FOUND"

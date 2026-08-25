@@ -126,3 +126,17 @@ CACHE_MAX_ENTRIES: int = _env_int("TAXLAW_CACHE_MAX", "NTS_CACHE_MAX", default=6
 #: :func:`korean_taxlaw_mcp.html_text.truncate` 가 호출자에게 상한을 못 받았을 때의
 #: 마지막 안전망. 정상 경로에서는 도메인 계층이 사이트별 `body_limit` 을 넘긴다.
 FALLBACK_BODY_LIMIT: int = min(NTS.body_limit, OLTA.body_limit)
+
+
+# ─── 응답 크기 정책 (LLM 컨텍스트 토큰 예산) ─────────────────────────────────
+# 검색 결과는 LLM 이 후보를 고르는 목록이다. 기본값을 낮게 잡고, 더 필요하면
+# 호출자가 limit 을 명시한다. 값을 조정할 때는 여기 한 곳만 바꾼다.
+
+#: 검색 도구(해석례·결정례·지방세·서식)의 기본 페이지 크기.
+DEFAULT_SEARCH_LIMIT: int = 10
+
+#: 기본통칙·집행기준·고시·훈령 조회의 기본 반환 조항 수.
+DEFAULT_GUIDANCE_LIMIT: int = 20
+
+#: NOT_FOUND 응답에 담는 유사문서 최대 개수.
+DEFAULT_SIMILAR_LIMIT: int = 5

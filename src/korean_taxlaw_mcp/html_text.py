@@ -103,6 +103,10 @@ class SplitBody:
     sections: dict[str, str] = field(default_factory=dict)
 #: 분해 과정을 확인할 수 있도록 원문에서 읽은 절 제목을 그대로 남긴다.
     headings: list[dict[str, str]] = field(default_factory=list)
+    #: 첫 절 제목 앞에 있던 텍스트. 절이 하나라도 잡히면 절 구간이 첫 제목부터
+    #: 끝까지 연속이므로, preamble + 절 제목 줄 + sections = 전체 텍스트다.
+    #: 이 불변식 덕에 절이 분해된 문서는 fullText 를 중복으로 싣지 않아도 된다.
+    preamble: str = ""
 
 
 def split_sections(text: str) -> SplitBody:
@@ -147,10 +151,13 @@ def split_sections(text: str) -> SplitBody:
             continue
         sections[name] = f"{sections[name]}\n\n{body}" if name in sections else body
 
+    preamble = "\n".join(lines[: kept[0][0]]).strip() if kept else ""
+
     return SplitBody(
         text=text,
         sections=sections,
         headings=[{"raw": raw, "name": name} for _i, raw, name, _o in kept],
+        preamble=preamble,
     )
 
 
@@ -181,3 +188,15 @@ def truncate(text: str, limit: int | None = None) -> Truncated:
         "나머지는 sourceUrl 원문에서 확인하세요.]"
     )
     return Truncated(text[:cap] + note, True, original)
+
+
+def attach_full_text(out: dict[str, object], text: str, limit: int | None) -> None:
+    """``fullText``(+절단 표식)를 응답 dict 에 싣는 단일 규칙.
+
+    국세·지방세 상세가 같은 계약을 쓴다: 잘리지 않았으면 플래그를 싣지 않는다.
+    """
+    full = truncate(text, limit)
+    out["fullText"] = full.text
+    if full.truncated:
+        out["fullTextTruncated"] = True
+        out["fullTextOriginalLength"] = full.original_length
