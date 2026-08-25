@@ -26,11 +26,12 @@ from datetime import date
 from typing import Any
 
 from ..codes import LOCAL_TAX_TYPE
-from ..config import OLTA
+from ..config import DEFAULT_SIMILAR_LIMIT, OLTA
 from ..errors import ErrorCode, NtsError, not_found
-from ..html_text import truncate
+from ..html_text import attach_full_text, truncate
 from ..local_doc_number import is_same_local_doc_number, parse_local_doc_number
 from ..model import AUTHORITY_LABEL, AuthorityLevel
+from ..payload import drop_empty, slim
 from ..olta_client import SOURCES, detail_html, detail_url, search_html
 from ..olta_parse import DETAIL_SECTION_NAMES, parse_detail, parse_rows, parse_total
 from ..cache import TTL
@@ -117,7 +118,7 @@ def _summary(kind: str, row: dict[str, str]) -> dict[str, Any]:
         "decisionResult": row.get("decisionResult"),
         "sourceUrl": detail_url(kind, row["num"], row.get("relationshipNum")),
     }
-    return {k: v for k, v in out.items() if v not in (None, "")}
+    return drop_empty(out)
 
 
 async def search_local_documents(
@@ -265,13 +266,9 @@ async def get_local_document(
     full_text = str(parsed.get("fullText") or "")
     has_sections = any(parsed.get(name) for name in DETAIL_SECTION_NAMES)
     if include_full_text and full_text and not has_sections:
-        full = truncate(full_text, limit)
-        out["fullText"] = full.text
-        if full.truncated:
-            out["fullTextTruncated"] = True
-            out["fullTextOriginalLength"] = full.original_length
+        attach_full_text(out, full_text, limit)
 
-    return {k: v for k, v in out.items() if v not in (None, "", [])}
+    return drop_empty(out)
 
 
 async def lookup_local_by_document_number(
@@ -280,7 +277,7 @@ async def lookup_local_by_document_number(
     kinds: list[str] | None = None,
     include_full_text: bool = True,
     body_limit: int | None = None,
-    similar_limit: int = 5,
+    similar_limit: int = DEFAULT_SIMILAR_LIMIT,
 ) -> dict[str, Any]:
     """문서번호로 지방세 문서를 찾는다. **정확히 일치할 때만** found.
 
@@ -329,9 +326,7 @@ async def lookup_local_by_document_number(
         "kind", "documentType", "documentNumber", "title",
         "registrationDate", "documentId", "relationshipNum",
     )
-    similar_documents = [
-        {k: s[k] for k in keep if s.get(k)} for s in list(similar.values())[:similar_limit]
-    ]
+    similar_documents = [slim(s, keep) for s in list(similar.values())[:similar_limit]]
     out: dict[str, Any] = {
         "found": False,
         "exactMatch": False,

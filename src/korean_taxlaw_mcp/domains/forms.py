@@ -19,6 +19,7 @@ from ..action_client import call_action
 from ..cache import TTL
 from ..config import NTS_ORIGIN
 from ..model import AuthorityLevel
+from ..payload import drop_empty
 from ..query import format_date
 
 FORMS_URL = f"{NTS_ORIGIN}/af/USEAFB001M.do"
@@ -92,7 +93,7 @@ async def search_forms(
             "lawName": (str(r["ntstNm"]).strip() if r.get("ntstNm") else matched_law),
             "revisionDate": format_date(r.get("ntstPmgDt")),
         }
-        items.append({k: v for k, v in entry.items() if v is not None})
+        items.append(drop_empty(entry))
 
     out: dict[str, Any] = {
         "authorityLevel": str(AuthorityLevel.ENFORCEMENT_RULE),
