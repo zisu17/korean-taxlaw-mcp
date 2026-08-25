@@ -184,11 +184,13 @@ async def test_search_interpretations_shape(upstream) -> None:
     assert label == "OK"
     assert data["domain"] == "interpretation"
     assert data["items"]
+    # 항목별 URL 대신 응답에 템플릿 하나 — ntstDcmId 를 끼우면 상세 화면 주소가 된다
+    assert "{ntstDcmId}" in data["sourceUrlTemplate"]
     for item in data["items"]:
         # 검색 결과는 후보 목록이다 — 본문·상수 boilerplate 를 싣지 않는다
-        for banned in ("fullText", "facts", "reasoning", "citation", "authorityLevel"):
+        for banned in ("fullText", "facts", "reasoning", "citation", "authorityLevel", "sourceUrl"):
             assert banned not in item, f"검색 결과에 {banned} 가 실렸다"
-        assert item["ntstDcmId"] and item["sourceUrl"]
+        assert item["ntstDcmId"]
 
 
 async def test_search_sends_and_semantics_to_upstream(upstream) -> None:
